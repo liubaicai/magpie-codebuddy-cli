@@ -27,19 +27,30 @@ const ASSISTANT_BLOCK_TYPES = new Set(["text", "thinking", "redacted_thinking", 
 
 // ---- request normalisation ----------------------------------------------
 
+const isInstruction = (message) => message?.role === "system" || message?.role === "developer"
+
+function instructionText(message) {
+  const content = message.content
+  if (typeof content !== "string" && (!Array.isArray(content) || content.some((block) =>
+    typeof block !== "string" && (block?.type !== "text" || typeof block.text !== "string")))) {
+    throw new UnsupportedContent(`a non-text ${message.role} message`)
+  }
+  return contentText(content)
+}
+
 /**
- * Anthropic allows the opening system prompt in the `system` field or as
- * leading system messages. Both are folded into one `system` string so every
- * later step sees the same shape.
+ * ACP has one system prompt. Preserve system/developer instructions wherever
+ * they occur, in message order after the top-level system field, rather than
+ * replaying them as user history or dropping instructions after the last user.
  */
 export function canonicalBody(body) {
   const messages = body?.messages
   if (!Array.isArray(messages)) return body
-  let count = 0
-  while (count < messages.length && messages[count]?.role === "system") count++
-  if (!count || count === messages.length) return body
-  const parts = [systemText(body), ...messages.slice(0, count).map((message) => contentText(message.content))]
-  return { ...body, system: parts.filter((part) => part.trim()).join("\n\n"), messages: messages.slice(count) }
+  const instructions = messages.filter(isInstruction)
+  if (!instructions.length) return body
+  const parts = [systemText(body), ...instructions.map(instructionText)]
+  return { ...body, system: parts.filter((part) => part.trim()).join("\n\n"),
+    messages: messages.filter((message) => !isInstruction(message)) }
 }
 
 export function systemText(body) {
@@ -85,6 +96,7 @@ export function validateBody(body) {
     if (!isObject(message) || !MESSAGES_ROLES.has(message.role)) {
       throw new UnsupportedContent(`a message with role ${JSON.stringify(message?.role)}`)
     }
+    if (isInstruction(message)) instructionText(message)
     if (message.role === "assistant" && Array.isArray(message.content)) {
       for (const block of message.content) {
         if (typeof block === "string") continue
@@ -101,9 +113,8 @@ export function validateBody(body) {
       }
     }
   }
-  const last = body.messages.at(-1)
-  const trailingUser = last?.role === "user" || last?.role === "system" || last?.role === "developer"
-  if (!trailingUser) {
+  const last = body.messages.filter((message) => !isInstruction(message)).at(-1)
+  if (last?.role !== "user") {
     throw new UnsupportedContent(
       "a request whose last message is not from the user; continue an assistant turn from the client side instead",
     )

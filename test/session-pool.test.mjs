@@ -179,3 +179,29 @@ test("close waits for in-flight acquire and prewarm factories and reaps every re
   assert.deepEqual(pool.sessions(), [])
   await assert.rejects(acquire(pool, "b", factory()), /shutting down/)
 })
+
+test("catalog probes share capacity and queued claims wake on release, abort and close", async () => {
+  const { pool, counts, factory } = fixture(2)
+  const current = (await acquire(pool, "a", factory())).session
+  const inspected = deferred()
+  const probeFactory = factory()
+  const probing = pool.probe(probeFactory.run, async () => { await inspected.promise; return "models" })
+  await probeFactory.started
+  await assert.rejects(pool.probe(factory().run, () => []), unavailable)
+  assert.equal(counts.peak, 2)
+  inspected.resolve()
+  assert.equal(await probing, "models")
+  assert.equal(counts.live, 1)
+
+  const queued = pool.awaitTurn("a")
+  pool.release(current)
+  assert.equal(await queued, current)
+  const abort = new AbortController()
+  const cancelled = pool.awaitTurn("a", 300000, abort.signal)
+  abort.abort()
+  assert.equal(await cancelled, null)
+  const closing = pool.awaitTurn("a")
+  await pool.close()
+  assert.equal(await closing, null)
+  assert.equal(counts.live, 0)
+})

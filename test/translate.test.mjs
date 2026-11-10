@@ -43,6 +43,39 @@ test("leading system messages fold into the system field", () => {
   assert.deepEqual(body.messages, [{ role: "user", content: "hi" }])
 })
 
+test("system and developer instructions after the turn stay in the system prompt", () => {
+  const body = {
+    system: "base",
+    messages: [
+      { role: "developer", content: "first developer" },
+      { role: "user", content: "hi" },
+      { role: "system", content: [{ type: "text", text: "late system" }] },
+      { role: "developer", content: [{ type: "text", text: "final developer" }] },
+    ],
+  }
+  assert.doesNotThrow(() => validateBody(body))
+  const canonical = canonicalBody(body)
+  assert.equal(canonical.system, "base\n\nfirst developer\n\nlate system\n\nfinal developer")
+  assert.deepEqual(canonical.messages, [{ role: "user", content: "hi" }])
+  assert.equal(splitRequest(canonical).turn.content, "hi", "the last user is still the turn")
+})
+
+test("a non-text instruction is refused rather than silently dropped", () => {
+  for (const role of ["system", "developer"]) {
+    assert.throws(
+      () => validateBody({ messages: [{ role: "user", content: "hi" }, { role, content: [{ type: "image" }] }] }),
+      UnsupportedContent,
+    )
+  }
+})
+
+test("validateBody refuses a request with no conversational turn after folding instructions", () => {
+  assert.throws(
+    () => validateBody({ messages: [{ role: "developer", content: "rules" }] }),
+    /last message is not from the user/,
+  )
+})
+
 test("a body with no leading system messages is returned unchanged", () => {
   const body = { system: "s", messages: [{ role: "user", content: "hi" }] }
   assert.equal(canonicalBody(body), body)

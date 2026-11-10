@@ -107,7 +107,7 @@ const ok = (payload) => payload?.code === 0 || payload?.code === 200
 export class CodeBuddySignIn {
   #fetch
   #now
-  #flow
+  #flows = new Map()
 
   constructor({ fetch: fetcher = globalThis.fetch, now = Date.now } = {}) {
     this.#fetch = fetcher
@@ -115,7 +115,13 @@ export class CodeBuddySignIn {
   }
 
   get pending() {
-    return Boolean(this.#flow)
+    this.#prune()
+    return this.#flows.size > 0
+  }
+
+  #prune() {
+    const now = this.#now()
+    for (const [state, flow] of this.#flows) if (now >= flow.expires) this.#flows.delete(state)
   }
 
   #request(path, init = {}) {
@@ -151,7 +157,7 @@ export class CodeBuddySignIn {
 
   /** Begin a sign-in: returns the page to open and the flow's id. */
   async start() {
-    this.#flow = undefined
+    this.#prune()
     const payload = await this.#request("/auth/state?platform=workbuddy", {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
@@ -172,7 +178,7 @@ export class CodeBuddySignIn {
         // Keep CodeBuddy's own page.
       }
     }
-    this.#flow = { state, expires: this.#now() + FLOW_TTL_MS }
+    this.#flows.set(state, { expires: this.#now() + FLOW_TTL_MS })
     return { url, state, expiresIn: Math.floor(FLOW_TTL_MS / 1000), interval: POLL_INTERVAL_S }
   }
 
@@ -182,12 +188,13 @@ export class CodeBuddySignIn {
    * Returns the account when it has, or null while it is still waiting.
    */
   async poll(state) {
-    const flow = this.#flow
-    if (!flow || flow.state !== state) throw new SignInError("this sign-in is no longer active")
+    const flow = this.#flows.get(state)
+    if (!flow) throw new SignInError("this sign-in is no longer active")
     if (this.#now() >= flow.expires) {
-      this.#flow = undefined
+      this.#flows.delete(state)
       throw new SignInError("the sign-in expired; start it again")
     }
+    this.#prune()
     const payload = await this.#request(`/auth/token?state=${encodeURIComponent(state)}`, {
       method: "GET",
       headers: { Accept: "application/json" },
@@ -218,12 +225,13 @@ export class CodeBuddySignIn {
     } catch {
       // The token is what matters; a name is only how Magpie shows the account.
     }
-    this.#flow = undefined
+    this.#flows.delete(state)
     return { token, identity }
   }
 
-  cancel() {
-    this.#flow = undefined
+  cancel(state) {
+    if (state === undefined) this.#flows.clear()
+    else this.#flows.delete(state)
   }
 }
 

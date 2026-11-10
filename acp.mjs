@@ -6,7 +6,7 @@
 // calls the client's tools through the MCP server it was handed in session/new.
 // This file only speaks the protocol; what a turn means is bridge.mjs's business.
 
-import { spawn } from "node:child_process"
+import { spawnCodebuddy } from "./platform.mjs"
 
 const LINE_LIMIT = 64 * 1024 * 1024
 const DEFAULT_START_TIMEOUT_MS = 60_000
@@ -456,21 +456,41 @@ export class CodeBuddySession {
     this.killed = true
     this.dead = true
     const child = this.child
+    // A fully reaped child's old group id may have been reused. Still reap a
+    // running child or descendants whose inherited pipes keep the connection open.
+    const shouldKill = !this.connection.closed || (child.exitCode === null && child.signalCode === null)
     this.connection.close(new Error("CodeBuddy ACP session stopped"))
     try {
       child.stdin?.destroy()
     } catch {}
-    try {
-      child.kill("SIGKILL")
-    } catch {}
+    const pid = child.pid
+    // Never turn a missing/invalid PID into a process-group broadcast, or target
+    // this process (or init) if a malformed child object reaches this boundary.
+    if (shouldKill && Number.isInteger(pid) && pid > 1 && pid !== process.pid) {
+      try {
+        if (process.platform !== "win32") {
+          // spawnCodebuddy gives the CLI its own process group on POSIX. Reap its
+          // tools too, including descendants still holding the stdio pipes open.
+          process.kill(-pid, "SIGKILL")
+        } else {
+          child.kill("SIGKILL")
+        }
+      } catch {
+        try {
+          child.kill("SIGKILL")
+        } catch {}
+      }
+    }
     await new Promise((resolve) => {
       if (child.exitCode !== null || child.signalCode !== null) return resolve()
-      const timer = setTimeout(resolve, 2000)
-      timer.unref?.()
-      child.once("close", () => {
+      const finish = () => {
         clearTimeout(timer)
+        child.removeListener("close", finish)
         resolve()
-      })
+      }
+      const timer = setTimeout(finish, 2000)
+      timer.unref?.()
+      child.once("close", finish)
     })
   }
 }
@@ -491,29 +511,7 @@ export async function openCodeBuddySession({
   startTimeoutMs = DEFAULT_START_TIMEOUT_MS,
   signal,
 }) {
-  const child = spawn(launch.command, [...launch.args, ...argv], {
-    cwd,
-    env,
-    shell: false,
-    windowsHide: true,
-    stdio: ["pipe", "pipe", "pipe"],
-    detached: process.platform !== "win32",
-  })
-
-  const started = new Promise((resolve, reject) => {
-    child.once("error", reject)
-    child.once("spawn", resolve)
-  })
-  await Promise.race([
-    started,
-    new Promise((_, reject) => {
-      const timer = setTimeout(
-        () => reject(new Error(`CodeBuddy ACP process did not start within ${startTimeoutMs}ms`)),
-        startTimeoutMs,
-      )
-      timer.unref?.()
-    }),
-  ])
+  const child = spawnCodebuddy(launch, argv, { cwd, env })
 
   // Build the session object before the handshake so the metadata notification
   // that arrives before session/new has somewhere to go.
@@ -527,6 +525,24 @@ export async function openCodeBuddySession({
   })
 
   try {
+    await new Promise((resolve, reject) => {
+      const finish = (error) => {
+        clearTimeout(timer)
+        child.removeListener("error", onError)
+        child.removeListener("spawn", onSpawn)
+        if (error) reject(error)
+        else resolve()
+      }
+      const onError = (error) => finish(error)
+      const onSpawn = () => finish()
+      const timer = setTimeout(
+        () => finish(new Error(`CodeBuddy ACP process did not start within ${startTimeoutMs}ms`)),
+        startTimeoutMs,
+      )
+      timer.unref?.()
+      child.once("error", onError)
+      child.once("spawn", onSpawn)
+    })
     const init = await session.connection.request(
       "initialize",
       { protocolVersion: 1, clientCapabilities: {}, clientInfo },

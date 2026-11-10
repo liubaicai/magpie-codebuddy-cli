@@ -329,6 +329,9 @@ test("a client tool becomes tool_use, and its result is delivered to the model",
   assert.ok(toolUse, "a tool_use block must be sent")
   assert.equal(toolUse.name, "get_weather")
   assert.deepEqual(toolUse.input, { city: "Paris" })
+  // Disposing another plugin instance must not reject or forget this live call.
+  const unrelated = await CodeBuddyCliPlugin()
+  await unrelated.dispose()
 
   // Handing the result back must be accepted for that call, not refused as
   // belonging to some other turn.
@@ -720,4 +723,106 @@ test("an account's token is what its CodeBuddy process runs under", async (t) =>
   const seen = readFileSync(record, "utf8").trim().split("\n").filter(Boolean)
   assert.ok(seen.includes(token), `the CLI must run with the account's token, saw ${JSON.stringify(seen)}`)
   assert.ok(!seen.includes("none"), "no process may start without an account's token")
+  const oldMachine = process.env.CODEBUDDY_AUTH_TOKEN
+  process.env.CODEBUDDY_AUTH_TOKEN = "machine-token-must-not-be-used"
+  try {
+    for (const getAuth of [async () => undefined, async () => ({}), async () => { throw new Error("unreadable") }]) {
+      const scoped = await hooks.auth.loader(getAuth)
+      const failed = await scoped.fetch("codebuddy-cli://local/v1/messages", { method: "POST",
+        body: JSON.stringify({ model: "codebuddy-cli/hy3", messages: [{ role: "user", content: "hi" }] }) })
+      assert.equal(failed.status, 401)
+      assert.equal(failed.headers.get("x-should-retry"), "false")
+    }
+    assert.deepEqual(readFileSync(record, "utf8").trim().split("\n").filter(Boolean), seen)
+  } finally {
+    if (oldMachine === undefined) delete process.env.CODEBUDDY_AUTH_TOKEN
+    else process.env.CODEBUDDY_AUTH_TOKEN = oldMachine
+  }
+})
+
+test("an abandoned tool turn, including a rejected result, expires and frees its process", async (t) => {
+  const { dir, launcher, record } = fakeLaunch({ prompts: [{
+    mcpCalls: [{ name: "lookup", arguments: {}, fold: false }],
+  }] })
+  const keys = ["CODEBUDDY_PATH", "CODEBUDDY_BRIDGE_TOOL_DEADLINE_MS", "CODEBUDDY_BRIDGE_TOOL_TIMEOUT_MS", "CODEBUDDY_BRIDGE_QUEUE_MS"]
+  const old = Object.fromEntries(keys.map((key) => [key, process.env[key]]))
+  Object.assign(process.env, { CODEBUDDY_PATH: launcher, CODEBUDDY_BRIDGE_TOOL_DEADLINE_MS: "40",
+    CODEBUDDY_BRIDGE_TOOL_TIMEOUT_MS: "400", CODEBUDDY_BRIDGE_QUEUE_MS: "3000" })
+  const { CodeBuddyCliPlugin } = await import("../index.mjs")
+  const hooks = await CodeBuddyCliPlugin()
+  t.after(async () => {
+    await hooks.dispose()
+    for (const key of keys) { if (old[key] === undefined) delete process.env[key]; else process.env[key] = old[key] }
+    rmSync(dir, { recursive: true, force: true })
+  })
+  const body = { model: "codebuddy-cli/hy3", stream: true, tools: [{ name: "lookup", input_schema: { type: "object" } }],
+    messages: [{ role: "user", content: "look up" }] }
+  const first = await ask(hooks, body)
+  assert.equal(stopOf(first.events), "tool_use")
+  const wrong = await ask(hooks, { ...body, messages: [...body.messages,
+    { role: "assistant", content: blocksOf(first.events) },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "wrong-id", content: "bad" }] }] })
+  assert.equal(wrong.status, 409)
+  const recovered = await ask(hooks, body)
+  assert.equal(recovered.status, 200, recovered.text)
+  assert.equal(stopOf(recovered.events), "tool_use")
+  const prompts = readRecord(record).filter((row) => row.method === "session/prompt")
+  assert.equal(prompts.length, 2)
+  assert.notEqual(prompts[0].params.sessionId, prompts[1].params.sessionId)
+})
+
+test("a late tool result is answered after the placeholder prompt has already finished", async (t) => {
+  const { dir, launcher, record } = fakeLaunch({ prompts: [
+    { mcpCalls: [{ name: "lookup", arguments: {}, fold: false }] }, { text: ["real late result"], delayMs: 700 },
+  ] })
+  const oldDeadline = process.env.CODEBUDDY_BRIDGE_TOOL_DEADLINE_MS
+  const oldToolTimeout = process.env.CODEBUDDY_BRIDGE_TOOL_TIMEOUT_MS
+  process.env.CODEBUDDY_PATH = launcher
+  process.env.CODEBUDDY_BRIDGE_TOOL_DEADLINE_MS = "40"
+  process.env.CODEBUDDY_BRIDGE_TOOL_TIMEOUT_MS = "500"
+  const { CodeBuddyCliPlugin } = await import("../index.mjs")
+  const hooks = await CodeBuddyCliPlugin()
+  t.after(async () => {
+    await hooks.dispose()
+    delete process.env.CODEBUDDY_PATH
+    if (oldDeadline === undefined) delete process.env.CODEBUDDY_BRIDGE_TOOL_DEADLINE_MS
+    else process.env.CODEBUDDY_BRIDGE_TOOL_DEADLINE_MS = oldDeadline
+    if (oldToolTimeout === undefined) delete process.env.CODEBUDDY_BRIDGE_TOOL_TIMEOUT_MS
+    else process.env.CODEBUDDY_BRIDGE_TOOL_TIMEOUT_MS = oldToolTimeout
+    rmSync(dir, { recursive: true, force: true })
+  })
+  const body = { model: "codebuddy-cli/hy3", stream: true, tools: [{ name: "lookup", input_schema: { type: "object" } }],
+    messages: [{ role: "user", content: "look up" }] }
+  const first = await ask(hooks, body)
+  assert.equal(stopOf(first.events), "tool_use")
+  await waitFor(() => readRecord(record).some((row) => row.type === "prompt-finished"))
+  const call = blocksOf(first.events).find((block) => block.type === "tool_use")
+  const resumed = await ask(hooks, { ...body, messages: [...body.messages,
+    { role: "assistant", content: blocksOf(first.events) },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: call.id, content: "42" }] }] })
+  assert.equal(resumed.status, 200, resumed.text)
+  assert.match(blocksOf(resumed.events).filter((block) => block.type === "text").map((block) => block.text).join(""), /real late result/)
+  assert.equal(stopOf(resumed.events), "end_turn")
+  const prompts = readRecord(record).filter((row) => row.method === "session/prompt")
+  assert.equal(prompts.length, 2)
+  assert.equal(prompts[0].params.sessionId, prompts[1].params.sessionId)
+})
+
+test("parallel account catalog refreshes share the configured process cap", async (t) => {
+  const { dir, launcher, record } = fakeLaunch({})
+  const oldLimit = process.env.CODEBUDDY_BRIDGE_MAX_PROCS
+  process.env.CODEBUDDY_PATH = launcher
+  process.env.CODEBUDDY_BRIDGE_MAX_PROCS = "1"
+  const { CodeBuddyCliPlugin } = await import(`../index.mjs?probe-cap=${Date.now()}`)
+  const hooks = await CodeBuddyCliPlugin()
+  t.after(async () => {
+    await hooks.dispose()
+    delete process.env.CODEBUDDY_PATH
+    if (oldLimit === undefined) delete process.env.CODEBUDDY_BRIDGE_MAX_PROCS
+    else process.env.CODEBUDDY_BRIDGE_MAX_PROCS = oldLimit
+    rmSync(dir, { recursive: true, force: true })
+  })
+  await Promise.all(["catalog-account-a", "catalog-account-a", "catalog-account-b", "catalog-account-c"].map((access) =>
+    hooks.provider.models(undefined, { auth: { access } })))
+  assert.equal(readRecord(record).filter((row) => row.type === "session-opened").length, 1)
 })

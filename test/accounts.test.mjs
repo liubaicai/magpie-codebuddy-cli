@@ -93,12 +93,14 @@ test("an account carries what Magpie shows and when it lapses", () => {
 // A fetch that answers the three calls the flow makes.
 function fakeFetch({ state = "state-abc", token: issued, failState = false, neverReady = false } = {}) {
   const calls = []
+  let starts = 0
   const fetch = async (url, init = {}) => {
     calls.push({ url: String(url), method: init.method ?? "GET" })
     const json = (body) => new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } })
     if (String(url).includes("/auth/state")) {
       if (failState) return new Response("{}", { status: 500 })
-      return json({ code: 0, data: { state, authUrl: `https://www.codebuddy.cn/login?state=${state}` } })
+      const next = starts++ ? `${state}-2` : state
+      return json({ code: 0, data: { state: next, authUrl: `https://www.codebuddy.cn/login?state=${next}` } })
     }
     if (String(url).includes("/auth/token")) {
       if (neverReady) return json({ code: 0, data: {} })
@@ -145,11 +147,36 @@ test("polling again after the sign-in finished is refused", async () => {
   await assert.rejects(() => signIn.poll(started.state), SignInError)
 })
 
+test("starting another sign-in does not cancel the first account's flow", async () => {
+  const issued = token({ sub: "u1", nickname: "Ann" })
+  const { fetch } = fakeFetch({ token: issued })
+  const signIn = new CodeBuddySignIn({ fetch })
+  const first = await signIn.start()
+  const second = await signIn.start()
+  assert.notEqual(first.state, second.state)
+  assert.equal((await signIn.poll(first.state)).token, issued)
+  assert.equal((await signIn.poll(second.state)).token, issued)
+})
+
+test("cancel scopes to one flow, or all when no state is given", async () => {
+  const { fetch } = fakeFetch({ token: token({ sub: "u1" }) })
+  const signIn = new CodeBuddySignIn({ fetch })
+  const first = await signIn.start()
+  const second = await signIn.start()
+  signIn.cancel(first.state)
+  await assert.rejects(() => signIn.poll(first.state), SignInError)
+  assert.ok(await signIn.poll(second.state))
+  signIn.cancel()
+  assert.equal(signIn.pending, false)
+})
+
 test("a sign-in that is not authorised yet reports nothing", async () => {
-  const { fetch } = fakeFetch({ neverReady: true })
+  const { fetch, calls } = fakeFetch({ neverReady: true })
   const signIn = new CodeBuddySignIn({ fetch })
   const started = await signIn.start()
   assert.equal(await signIn.poll(started.state), null)
+  assert.ok(!calls.some((call) => call.url.endsWith("/accounts")),
+    "the account list is only fetched once a token exists")
 })
 
 test("a sign-in CodeBuddy refuses says so", async () => {

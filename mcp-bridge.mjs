@@ -177,8 +177,8 @@ export class ToolBridge {
       res.end()
       return
     }
-    const url = req.url ?? "/"
-    if (!url.startsWith("/mcp")) {
+    const pathname = (req.url ?? "/").split("?", 1)[0]
+    if (pathname !== "/mcp") {
       res.writeHead(404)
       res.end()
       return

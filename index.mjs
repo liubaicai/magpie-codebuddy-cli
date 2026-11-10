@@ -24,7 +24,6 @@ import {
 } from "./acp.mjs"
 import {
   codebuddyLaunchArgs,
-  codebuddyVersion,
   findCodebuddy,
 } from "./platform.mjs"
 import { CodeBuddySignIn, POLL_INTERVAL_S, SignInError, tokenIdentity, validToken } from "./accounts.mjs"
@@ -210,29 +209,27 @@ export function modelsFromSession(session) {
  * Magpie waits about two seconds for models(), so this runs in the background:
  * the first call returns the fallback list and later ones the real catalog.
  */
-function refreshCatalog() {
+function refreshCatalog(pool) {
   if (catalogPromise) return catalogPromise
   catalogPromise = (async () => {
-    let session = null
     try {
       const launch = await launchOf()
       if (!launch) {
         catalogError = "the codebuddy CLI was not found; set CODEBUDDY_PATH"
         return null
       }
-      session = await openCodeBuddySession({
+      const models = await pool.probe(() => openCodeBuddySession({
         launch,
         argv: codebuddyLaunchArgs({ sessionPersistence: false }),
         cwd: process.cwd(),
         env: childEnv(),
         startTimeoutMs: envNumber("CODEBUDDY_BRIDGE_START_TIMEOUT_MS", CATALOG_PROBE_TIMEOUT_MS),
-      })
-      const models = modelsFromSession(session)
+      }), modelsFromSession)
       if (models.length) {
         catalog = models
         catalogAt = Date.now()
         catalogError = null
-        log(`catalog: ${models.length} models from codebuddy ${await codebuddyVersion(launch).catch(() => null) ?? ""}`.trim())
+        log(`catalog: ${models.length} models from codebuddy`)
       }
       return models.length ? models : null
     } catch (error) {
@@ -240,16 +237,15 @@ function refreshCatalog() {
       log(`catalog probe failed: ${catalogError}`)
       return null
     } finally {
-      await session?.stop().catch(() => {})
       catalogPromise = null
     }
   })()
   return catalogPromise
 }
 
-async function currentCatalog({ wait = false } = {}) {
+async function currentCatalog({ wait = false, pool } = {}) {
   if (catalogFresh()) return catalog
-  const promise = refreshCatalog()
+  const promise = refreshCatalog(pool)
   if (wait) {
     const models = await promise
     if (models?.length) return models
@@ -271,39 +267,43 @@ async function currentCatalog({ wait = false } = {}) {
 // Per-account catalogs. Magpie asks each account for its own list, and the
 // accounts differ: a plan's models are the account's, not the plugin's.
 const accountCatalogs = new Map()
+const accountCatalogPending = new Map()
 const ACCOUNT_CATALOG_LIMIT = 32
 
-async function catalogFor(token) {
+async function catalogFor(token, pool) {
   const key = accountKeyOf(token)
   const cached = accountCatalogs.get(key)
   if (cached && Date.now() - cached.at < envNumber("CODEBUDDY_BRIDGE_CATALOG_TTL_MS", DEFAULT_MODEL_CATALOG_TTL_MS)) {
     return cached.models
   }
-  const launch = await launchOf()
-  if (!launch) return fallbackCatalog()
-  let session = null
-  try {
-    session = await openCodeBuddySession({
-      launch,
-      argv: codebuddyLaunchArgs({ sessionPersistence: false }),
-      cwd: process.cwd(),
-      env: childEnv(token),
-      startTimeoutMs: envNumber("CODEBUDDY_BRIDGE_START_TIMEOUT_MS", CATALOG_PROBE_TIMEOUT_MS),
-    })
-    const models = modelsFromSession(session)
-    if (!models.length) return fallbackCatalog()
-    accountCatalogs.set(key, { at: Date.now(), models })
-    while (accountCatalogs.size > ACCOUNT_CATALOG_LIMIT) {
-      accountCatalogs.delete(accountCatalogs.keys().next().value)
+  if (accountCatalogPending.has(key)) return accountCatalogPending.get(key)
+  const pending = (async () => {
+    try {
+      const launch = await launchOf()
+      if (!launch) return cached?.models ?? fallbackCatalog()
+      const models = await pool.probe(() => openCodeBuddySession({
+        launch,
+        argv: codebuddyLaunchArgs({ sessionPersistence: false }),
+        cwd: process.cwd(),
+        env: childEnv(token),
+        startTimeoutMs: envNumber("CODEBUDDY_BRIDGE_START_TIMEOUT_MS", CATALOG_PROBE_TIMEOUT_MS),
+      }), modelsFromSession)
+      if (!models.length) return cached?.models ?? fallbackCatalog()
+      accountCatalogs.set(key, { at: Date.now(), models })
+      while (accountCatalogs.size > ACCOUNT_CATALOG_LIMIT) {
+        accountCatalogs.delete(accountCatalogs.keys().next().value)
+      }
+      return models
+    } catch (error) {
+      catalogError = String(error?.message ?? error)
+      log(`catalog probe failed for an account: ${catalogError}`)
+      return cached?.models ?? fallbackCatalog()
+    } finally {
+      accountCatalogPending.delete(key)
     }
-    return models
-  } catch (error) {
-    catalogError = String(error?.message ?? error)
-    log(`catalog probe failed for an account: ${catalogError}`)
-    return fallbackCatalog()
-  } finally {
-    await session?.stop().catch(() => {})
-  }
+  })()
+  accountCatalogPending.set(key, pending)
+  return pending
 }
 
 /** The catalog entry for a requested model id, matching loosely. */
@@ -414,28 +414,19 @@ export function requestedEffort(body) {
 // Keyed by the call id a client sends back. A call is removed once it has been
 // settled and its result has been handed to the model, so a later request cannot
 // match a call that belongs to an older turn.
-const heldCalls = new Map()
 const HELD_LIMIT = 256
-
-function rememberHeld(call) {
-  heldCalls.set(call.id, call)
-  while (heldCalls.size > HELD_LIMIT) heldCalls.delete(heldCalls.keys().next().value)
-}
 
 function toolCallId() {
   return "toolu_" + randomBytes(12).toString("hex")
 }
 
 class Bridge {
+  heldCalls = new Map()
+
   constructor() {
-    this.pool = new SessionPool({
-      // A tool bridge is created per process before its session exists, so the
-      // callback is handed the session the call came from once it is known.
-      onToolCall: (name, args, meta) => this.#onToolCall(name, args, meta),
-    })
+    this.pool = new SessionPool()
     this.sweeper = setInterval(() => {
       this.pool.sweep().catch(() => {})
-      this.#sweepHeld()
     }, 60_000)
     this.sweeper.unref?.()
   }
@@ -453,10 +444,7 @@ class Bridge {
       args,
       turn,
       session: owner,
-      convKey: turn.convKey,
-      createdAt: Date.now(),
       clientSeen: false,
-      answered: false,
       settled: false,
       resolve: null,
       reject: null,
@@ -466,8 +454,11 @@ class Bridge {
       call.resolve = resolve
       call.reject = reject
     })
-    rememberHeld(call)
-    turn.pending.set(id, call)
+    for (const [oldId, old] of this.heldCalls) {
+      if (old.delivered) this.heldCalls.delete(oldId)
+    }
+    if (this.heldCalls.size >= HELD_LIMIT) throw new Error("too many pending CodeBuddy client tool results")
+    this.heldCalls.set(id, call)
     // Hand the call to the streaming response, which turns it into a tool_use.
     owner.push({ type: "tool-call", call })
     // CodeBuddy's MCP client will not wait forever; answer before it gives up and
@@ -475,7 +466,6 @@ class Bridge {
     call.deadline = setTimeout(() => {
       if (call.settled) return
       call.settled = true
-      call.answered = true
       call.resolve(stillRunningText(call))
     }, envNumber("CODEBUDDY_BRIDGE_TOOL_DEADLINE_MS", TOOL_DEADLINE_MS))
     call.deadline.unref?.()
@@ -494,36 +484,51 @@ class Bridge {
     return { bridge, attach: (session) => { owner.session = session } }
   }
 
-  #sweepHeld() {
-    const cutoff = Date.now() - envNumber("CODEBUDDY_BRIDGE_TOOL_TIMEOUT_MS", TOOL_RESULT_TIMEOUT_MS)
-    for (const [id, call] of [...heldCalls]) {
-      if (call.createdAt > cutoff && !call.settled) continue
+  finishTurn(turn) {
+    clearTimeout(turn.toolTimer)
+    turn.toolTimer = null
+    turn.finished = true
+    for (const [id, call] of this.heldCalls) {
+      if (call.turn !== turn) continue
+      clearTimeout(call.deadline)
       if (!call.settled) {
         call.settled = true
-        call.answered = true
-        try {
-          call.resolve(stillRunningText(call))
-        } catch {}
+        call.reject(new Error("the CodeBuddy turn has ended"))
       }
-      if (call.createdAt <= cutoff) {
-        clearTimeout(call.deadline)
-        heldCalls.delete(id)
-      }
+      this.heldCalls.delete(id)
     }
+  }
+
+  retireTurn(turn) {
+    if (turn.retiring) return turn.retiring
+    this.finishTurn(turn)
+    turn.session.busy = false
+    turn.session.cancel()
+    // Delete the mapping synchronously before reaping, so no new request can
+    // claim this process while it is stopping. Its slot stays counted until exit.
+    turn.retiring = this.pool.retire(turn.convKey, turn.session)
+    return turn.retiring
+  }
+
+  waitForTools(turn) {
+    clearTimeout(turn.toolTimer)
+    if (turn.finished) return
+    // This budget covers only time without a streaming reader, waiting for a
+    // client's next tool result. It never limits a progressing model response.
+    turn.toolTimer = setTimeout(() => {
+      if (!turn.finished && !turn.streaming) void this.retireTurn(turn).catch(() => {})
+    }, envNumber("CODEBUDDY_BRIDGE_TOOL_TIMEOUT_MS", TOOL_RESULT_TIMEOUT_MS))
+    turn.toolTimer.unref?.()
+  }
+
+  resumeTurn(turn) {
+    clearTimeout(turn.toolTimer)
+    turn.toolTimer = null
   }
 
   async close() {
     clearInterval(this.sweeper)
-    for (const call of heldCalls.values()) {
-      clearTimeout(call.deadline)
-      if (!call.settled) {
-        call.settled = true
-        try {
-          call.reject(new Error("the CodeBuddy bridge is shutting down"))
-        } catch {}
-      }
-    }
-    heldCalls.clear()
+    for (const turn of new Set([...this.heldCalls.values()].map((call) => call.turn))) this.finishTurn(turn)
     await this.pool.close()
   }
 }
@@ -650,9 +655,8 @@ function anthropicStream(session, turn, body, msgId, signal) {
         })
         send("message_stop", { type: "message_stop" })
         session.history = [...session.history, { role: "assistant", content }]
-        if (final) turn.finished = true
-        session.busy = false
-        session.lastUsedAt = Date.now()
+        if (final) turn.bridge.finishTurn(turn)
+        turn.bridge.pool.release(session)
       }
 
       const detach = () => {
@@ -667,10 +671,7 @@ function anthropicStream(session, turn, body, msgId, signal) {
       const abort = () => {
         if (finished) return
         detach()
-        turn.finished = true
-        session.busy = false
-        session.cancel()
-        void session.stop().catch(() => {})
+        void turn.bridge.retireTurn(turn).catch(() => {})
         try {
           controller.error(signal?.reason ?? new Error("request aborted"))
         } catch {}
@@ -749,6 +750,7 @@ function anthropicStream(session, turn, body, msgId, signal) {
             // unfinished turn keeps its process reserved until it is continued.
             stop("tool_use", false)
             detach()
+            turn.bridge.waitForTools(turn)
             controller.close()
             return
           }
@@ -765,9 +767,7 @@ function anthropicStream(session, turn, body, msgId, signal) {
               type: "error",
               error: { type: "api_error", message: String(event.error?.message ?? event.error) },
             })
-            turn.finished = true
-            session.busy = false
-            void session.stop().catch(() => {})
+            void turn.bridge.retireTurn(turn).catch(() => {})
             detach()
             controller.close()
             return
@@ -775,10 +775,7 @@ function anthropicStream(session, turn, body, msgId, signal) {
         }
       } catch (error) {
         if (finished) return
-        turn.finished = true
-        session.busy = false
-        session.cancel()
-        void session.stop().catch(() => {})
+        void turn.bridge.retireTurn(turn).catch(() => {})
         detach()
         try {
           closeBlock()
@@ -809,13 +806,28 @@ function anthropicStream(session, turn, body, msgId, signal) {
  * The prompt request is not awaited here; promptSession resolves in the
  * background and pushes turn-end or turn-error when it does.
  */
-function startTurn(session, convKey, body, { history, turn: lastMessage }) {
+function trackPrompt(turn, promise) {
+  turn.prompt = promise
+  void promise.then(({ stopReason, partial }) => {
+    if (turn.finished || turn.prompt !== promise) return
+    // Commit history only after the stream consumes this marker. A queued late
+    // tool-result prompt supersedes this marker, but not the original output.
+    turn.session.push({ type: "turn-end", stopReason, partial })
+  }).catch((error) => {
+    if (turn.finished || turn.prompt !== promise) return
+    turn.session.push({ type: "turn-error", error })
+    void turn.bridge.retireTurn(turn).catch(() => {})
+  })
+}
+
+function startTurn(session, convKey, body, { history, turn: lastMessage }, bridge) {
   const turn = {
     convKey,
     session,
-    pending: new Map(),
+    bridge,
     finished: false,
     streaming: false,
+    toolTimer: null,
   }
   // Whatever the previous turn left behind belongs to it, not this one: a
   // turn-end the old stream never read would otherwise end this turn at once,
@@ -853,19 +865,7 @@ function startTurn(session, convKey, body, { history, turn: lastMessage }) {
   parts.push(...turnParts(lastMessage))
   if (!parts.length) parts.push({ type: "text", text: "" })
 
-  void promptSession(session, parts)
-    .then(({ stopReason, partial }) => {
-      if (turn.finished) return
-      // Do not release the process until its stream has consumed this event and
-      // committed the assistant reply. Otherwise a racer can clear unread data.
-      session.push({ type: "turn-end", stopReason, partial })
-    })
-    .catch((error) => {
-      if (turn.finished) return
-      session.push({ type: "turn-error", error })
-      // A failed prompt's context is uncertain, even for a vendor API error.
-      void session.stop().catch(() => {})
-    })
+  trackPrompt(turn, promptSession(session, parts))
   return turn
 }
 
@@ -875,34 +875,25 @@ function startTurn(session, convKey, body, { history, turn: lastMessage }) {
  */
 function continueTurn(session, turn, results) {
   if (results.some(({ call }) => !call || call.session !== session || call.turn !== turn)) return false
+  turn.bridge.resumeTurn(turn)
+  const late = []
   for (const { block, call } of results) {
     const value = toolResultValue(block)
-    if (call && !call.settled) {
+    call.delivered = true
+    clearTimeout(call.deadline)
+    if (!call.settled) {
       call.settled = true
-      call.delivered = true
-      clearTimeout(call.deadline)
       call.resolve(value)
-      continue
+    } else {
+      late.push(`[the result of the tool call ${call.name} you asked for earlier]\n${value}\n[end of tool result]`)
     }
-    if (call) {
-      // The call was already answered with a placeholder; deliver the real
-      // result as a follow-up prompt so the model still sees it.
-      call.delivered = true
-      const text = `[the result of the tool call ${call.name} you asked for earlier]\n${value}\n[end of tool result]`
-      void promptSession(session, [{ type: "text", text }]).catch((error) => {
-        session.push({ type: "turn-error", error })
-      })
-      continue
-    }
-    // A result for a call this bridge does not know about: the client's history
-    // and the live turn disagree, so start over rather than guess.
-    session.push({
-      type: "turn-error",
-      error: new Error(
-        "this tool result does not belong to the active CodeBuddy turn; resend the request with the last consistent history",
-      ),
-    })
-    return false
+  }
+  if (late.length) {
+    // The placeholder may have finished the old prompt while nobody was reading.
+    // Wait for it before the follow-up; its stale end must not truncate the real
+    // result's reply. Only the final prompt in this chain emits turn-end.
+    session.events = session.events.filter((event) => event.type !== "turn-end")
+    trackPrompt(turn, turn.prompt.then(() => promptSession(session, [{ type: "text", text: late.join("\n\n") }])))
   }
   return true
 }
@@ -929,7 +920,7 @@ function toolResultValue(block) {
 }
 
 /** The tool_result blocks of a request whose last message is a tool round. */
-function toolResultsOf(body) {
+function toolResultsOf(body, bridge) {
   const { turn } = splitRequest(canonicalBody(body))
   if (!turn || turn.role !== "user" || !Array.isArray(turn.content)) return []
   const results = []
@@ -938,9 +929,9 @@ function toolResultsOf(body) {
     const id = String(block.tool_use_id ?? "")
     // A result whose call this bridge already answered is not a live round: the
     // model has seen it, so the request is an ordinary turn, not a continuation.
-    const call = heldCalls.get(id) ?? null
+    const call = bridge.heldCalls.get(id) ?? null
     if (call && call.delivered) {
-      heldCalls.delete(id)
+      bridge.heldCalls.delete(id)
       continue
     }
     results.push({ block, call })
@@ -966,7 +957,7 @@ function jsonError(status, message, code, extra) {
       headers: {
         "Content-Type": "application/json",
         // SDKs that honour this stop retrying a request that cannot succeed.
-        ...(status === 400 || status === 409 ? { "x-should-retry": "false" } : {}),
+        ...([400, 401, 409].includes(status) ? { "x-should-retry": "false" } : {}),
       },
     },
   )
@@ -992,7 +983,7 @@ async function handleMessages(body, signal, bridge, authToken) {
 
   // The model list of the account this request runs under, so a route that
   // picked an account resolves the model against that account's own catalog.
-  const models = authToken ? await catalogFor(authToken) : await currentCatalog()
+  const models = authToken ? await catalogFor(authToken, bridge.pool) : await currentCatalog({ pool: bridge.pool })
   const requested = String(body.model ?? "")
   const model = resolveModel(models, requested)
   const modelId = model?.id ?? (requested.includes("/") ? requested.split("/").pop() : requested)
@@ -1031,7 +1022,7 @@ async function handleMessages(body, signal, bridge, authToken) {
     && session.history.length === history.length && historyExtends(history, session.history)
 
   const live = bridge.pool.peek(convKey)
-  const results = toolResultsOf(normalized)
+  const results = toolResultsOf(normalized, bridge)
   if (results.some(({ call }) => call && call.session !== live)) {
     return jsonError(409, "this tool result belongs to a different account, model, or tool configuration")
   }
@@ -1132,12 +1123,19 @@ async function handleMessages(body, signal, bridge, authToken) {
         break
       } catch (error) {
         const current = bridge.pool.peek(convKey)
-        if (error?.statusCode !== 503 || !current || (!current.busy && (!current.turn || current.turn.finished))) throw error
+        if (error?.statusCode !== 503) throw error
         const remaining = deadline - Date.now()
         if (remaining <= 0) throw error
+        // A response can finish (or another waiter retire it) between acquire's
+        // rejection and this handler. Retry the claim instead of reporting busy.
+        if (!current) {
+          if (error.code === "conversation_busy") continue
+          throw error
+        }
+        if (!current.busy && (!current.turn || current.turn.finished)) continue
         const waited = await bridge.pool.awaitTurn(convKey, remaining, signal)
         if (signal?.aborted) {
-          if (waited) waited.busy = false
+          if (waited) bridge.pool.release(waited)
           throw new AcpCancelledError()
         }
         if (!waited) {
@@ -1152,7 +1150,7 @@ async function handleMessages(body, signal, bridge, authToken) {
           session = waited
           break
         }
-        waited.busy = false
+        bridge.pool.release(waited)
       }
     }
   } catch (error) {
@@ -1164,10 +1162,9 @@ async function handleMessages(body, signal, bridge, authToken) {
   // assistant content delivered by this stream, including tool-use responses.
   session.history = [...history, lastMessage]
   try {
-    startTurn(session, convKey, normalized, { history, turn: lastMessage })
+    startTurn(session, convKey, normalized, { history, turn: lastMessage }, bridge)
   } catch (error) {
-    session.busy = false
-    await session.stop().catch(() => {})
+    await bridge.retireTurn(session.turn).catch(() => {})
     throw error
   }
   void bridge.pool.prewarm(factory, spareKey)
@@ -1182,9 +1179,7 @@ async function handleMessages(body, signal, bridge, authToken) {
   try {
     const first = await session.peekNext(envNumber("CODEBUDDY_BRIDGE_FIRST_EVENT_MS", 2500), signal)
     if (first?.type === "turn-error") {
-      session.turn.finished = true
-      session.busy = false
-      await session.stop().catch(() => {})
+      await bridge.retireTurn(session.turn).catch(() => {})
       const error = first.error
       const status = error?.status === 401 || error?.status === 403 ? 401 : error?.status || 502
       const message = status === 401
@@ -1193,10 +1188,7 @@ async function handleMessages(body, signal, bridge, authToken) {
       return jsonError(status, message)
     }
   } catch (error) {
-    session.turn.finished = true
-    session.busy = false
-    session.cancel()
-    await session.stop().catch(() => {})
+    await bridge.retireTurn(session.turn).catch(() => {})
     if (signal?.aborted) throw new AcpCancelledError()
     throw error
   }
@@ -1290,31 +1282,6 @@ async function collectJson(stream) {
 
 // ---- the plugin ----------------------------------------------------------
 
-/** Whether the CLI is signed in: a session can be opened and lists models. */
-async function probeSignedIn() {
-  const launch = await launchOf()
-  if (!launch) return { ok: false, why: "the codebuddy CLI was not found" }
-  let session = null
-  try {
-    session = await openCodeBuddySession({
-      launch,
-      argv: codebuddyLaunchArgs({ sessionPersistence: false }),
-      cwd: process.cwd(),
-      env: childEnv(),
-      startTimeoutMs: envNumber("CODEBUDDY_BRIDGE_START_TIMEOUT_MS", START_TIMEOUT_MS),
-    })
-    const models = modelsFromSession(session)
-    if (!models.length) return { ok: false, why: "CodeBuddy listed no models for this account" }
-    catalog = models
-    catalogAt = Date.now()
-    return { ok: true, models }
-  } catch (error) {
-    return { ok: false, why: String(error?.message ?? error) }
-  } finally {
-    await session?.stop().catch(() => {})
-  }
-}
-
 export const CodeBuddyCliPlugin = async () => {
   const bridge = new Bridge()
   const signIn = new CodeBuddySignIn()
@@ -1330,8 +1297,9 @@ export const CodeBuddyCliPlugin = async () => {
         const stored = validToken(auth?.access ?? auth?.key)
         if (stored) return stored
       } catch {
-        // Fall through to the machine-wide token, if one is configured.
+        // A scoped account must never turn into the machine's default identity.
       }
+      throw Object.assign(new Error("cannot read this CodeBuddy account's authorization; sign in to this account again"), { statusCode: 401 })
     }
     return readToken()
   }
@@ -1378,7 +1346,7 @@ export const CodeBuddyCliPlugin = async () => {
                     }
                   }
                   if (Date.now() >= deadline) {
-                    signIn.cancel()
+                    signIn.cancel(started.state)
                     return { type: "failed", error: "the CodeBuddy sign-in expired; start it again" }
                   }
                   await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_S * 1000))
@@ -1447,8 +1415,8 @@ export const CodeBuddyCliPlugin = async () => {
           }
           // This request's account, read per call: the same loader serves every
           // account, and Magpie routes between them.
-          const token = await tokenOf(getAuth)
           try {
+            const token = await tokenOf(getAuth)
             const response = await handleMessages(body, init.signal, bridge, token)
             if (body.stream === false && response.ok) {
               return new Response(JSON.stringify(await collectJson(response.body)), {
@@ -1480,7 +1448,8 @@ export const CodeBuddyCliPlugin = async () => {
       // list is what the account can actually serve.
       models: async (_provider, context = {}) => {
         const token = validToken(context?.auth?.access ?? context?.auth?.key)
-        const models = token ? await catalogFor(token) : await currentCatalog()
+        if (context.auth != null && !token) throw new Error("this CodeBuddy account has no valid authorization")
+        const models = token ? await catalogFor(token, bridge.pool) : await currentCatalog({ pool: bridge.pool })
         const out = {}
         for (const model of models) {
           out[model.id] = {
@@ -1520,6 +1489,7 @@ export const CodeBuddyCliPlugin = async () => {
       ...(catalogError ? { error: catalogError } : {}),
     }),
     dispose: async () => {
+      signIn.cancel()
       await bridge.close()
     },
   }
@@ -1541,5 +1511,4 @@ export const _internal = {
   startTurn,
   continueTurn,
   fallbackCatalog,
-  probeSignedIn,
 }

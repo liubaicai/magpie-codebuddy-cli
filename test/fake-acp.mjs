@@ -747,6 +747,7 @@ async function runTurn(requestId, params) {
   if (spec.usage) emitUsage(sessionId, spec.usage)
 
   const stopReason = typeof spec.stopReason === 'string' ? spec.stopReason : 'end_turn'
+  if (scenario.recordSessions) appendRecord({ __fakeAcp: true, type: 'prompt-finished', sessionId })
   sendResult(requestId, { stopReason, userMessageId, _meta: buildMeta(spec, stopReason) })
 
   await finishTurn()

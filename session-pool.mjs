@@ -12,7 +12,7 @@ const positive = (value, fallback) => {
   const number = Number(value)
   return Number.isFinite(number) && number > 0 ? Math.trunc(number) : fallback
 }
-const serving = (session) => Boolean(session.busy || (session.turn && !session.turn.finished))
+const serving = (session) => Boolean(session.alive && (session.busy || (session.turn && !session.turn.finished)))
 
 export function poolLimits(env = process.env) {
   return {
@@ -36,6 +36,7 @@ export class SessionPool {
   #spareKey = ""
   #sparePending
   #spareStop
+  #waiters = new Set()
 
   constructor({ onToolCall, env = process.env } = {}) {
     this.#onToolCall = onToolCall
@@ -97,7 +98,12 @@ export class SessionPool {
       const existing = this.#sessions.get(convKey)
       // Busy and incomplete turns belong to their original caller, even when
       // forceNew or rewritten history asks for a different process.
-      if (existing && serving(existing)) throw this.#capacityError()
+      if (existing && serving(existing)) {
+        const error = new Error("CodeBuddy is still answering an earlier request for this conversation; try again")
+        error.statusCode = 503
+        error.code = "conversation_busy"
+        throw error
+      }
       if (existing?.alive && !forceNew && historyExtends(history, existing.history)) {
         existing.busy = true
         existing.lastUsedAt = Date.now()
@@ -175,6 +181,49 @@ export class SessionPool {
     return stopping
   }
 
+  /** Release a response's claim, waking queued callers only when reusable. */
+  release(session) {
+    session.busy = false
+    session.lastUsedAt = Date.now()
+    if (!serving(session)) this.#changed()
+  }
+
+  /** Retire an abandoned turn after its owner has marked it finished. */
+  retire(convKey, session) {
+    if (this.#sessions.get(convKey) !== session) return Promise.resolve()
+    return this.#retire(convKey)
+  }
+
+  /** Catalog sessions use the same startup, stopping and capacity accounting. */
+  async probe(factory, inspect) {
+    const session = await this.#launch(factory)
+    try {
+      return await inspect(session)
+    } finally {
+      await this.#stop(session)
+    }
+  }
+
+  #changed() {
+    for (const wake of [...this.#waiters]) wake()
+  }
+
+  #waitForChange(timeoutMs, signal) {
+    return new Promise((resolve) => {
+      const wake = () => {
+        clearTimeout(timer)
+        signal?.removeEventListener("abort", wake)
+        this.#waiters.delete(wake)
+        resolve()
+      }
+      const timer = setTimeout(wake, timeoutMs)
+      timer.unref?.()
+      this.#waiters.add(wake)
+      signal?.addEventListener("abort", wake, { once: true })
+      if (signal?.aborted) wake()
+    })
+  }
+
   async awaitTurn(convKey, timeoutMs = 300_000, signal) {
     const deadline = Date.now() + timeoutMs
     for (;;) {
@@ -183,11 +232,9 @@ export class SessionPool {
       if (!session?.alive) return null
       const claimed = this.claim(convKey)
       if (claimed) return claimed
-      if (Date.now() >= deadline) return null
-      await new Promise((resolve) => {
-        const timer = setTimeout(resolve, 50)
-        timer.unref?.()
-      })
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) return null
+      await this.#waitForChange(remaining, signal)
     }
   }
 
@@ -259,6 +306,7 @@ export class SessionPool {
     const stopping = Promise.resolve().then(() => session.stop()).catch(() => {}).finally(() => {
       this.#all.delete(session)
       this.#stopping.delete(session)
+      this.#changed()
     })
     this.#stopping.set(session, stopping)
     return stopping
@@ -288,6 +336,7 @@ export class SessionPool {
   close() {
     if (this.#closing) return this.#closing
     this.#closed = true
+    this.#changed()
     this.#sessions.clear()
     this.#spare = null
     this.#closing = (async () => {
