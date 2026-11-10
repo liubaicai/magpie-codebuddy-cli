@@ -304,6 +304,17 @@ test("history matching tolerates wire representations but detects assistant and 
   rewritten[1].content[1].input.a = 9
   assert.equal(historyExtends(rewritten, previous), false)
   assert.ok(historyExtends([{ role: "assistant", content: "answer" }], [{ role: "assistant", content: [{ type: "text", text: "answer" }] }]))
+  const withLead = structuredClone(previous)
+  withLead[1].content.unshift({ type: "text", text: " " })
+  assert.ok(historyExtends(incoming, withLead), "clients can omit the transport-only block")
+  assert.ok(historyExtends(withLead, withLead), "clients can retain the transport-only block")
+  const mergedLead = structuredClone(incoming)
+  mergedLead[1].content[0].text = " hello world"
+  assert.ok(historyExtends(mergedLead, withLead), "clients can merge the space with the answer")
+  mergedLead[1].content[0].text = " changed"
+  assert.equal(historyExtends(mergedLead, withLead), false, "the lead must not hide an edited answer")
+  assert.equal(historyExtends([{ role: "assistant", content: "answer" }],
+    [{ role: "assistant", content: " answer" }]), false, "real answer whitespace is not a transport lead")
 })
 
 // ---- tools ---------------------------------------------------------------

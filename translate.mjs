@@ -358,9 +358,19 @@ export function historyKey(body) {
  * that same prefix plus its new turn. A client that rewrote an earlier message
  * sends a different prefix, and the session must not be reused.
  */
+// A transport-only text block releases Magpie's pre-answer thinking hold.
+// Keep it ordinary whitespace so clients can hide it without showing a label.
+export const STREAM_THINKING_LEAD = " "
+
+function hasThinkingLead(message) {
+  const blocks = message?.content
+  return message?.role === "assistant" && Array.isArray(blocks) && blocks.length > 1 &&
+    blocks[0]?.type === "text" && blocks[0].text === STREAM_THINKING_LEAD
+}
+
 // Gateways may turn strings into text blocks, merge adjacent text deltas, omit
-// thinking/signatures, or reorder JSON object keys. Those are representation
-// changes; assistant text and tool IDs/arguments must still agree exactly.
+// thinking/signatures or the transport lead, or reorder JSON object keys. Those
+// are representation changes; actual assistant text and tool inputs must agree.
 function comparableContent(content, assistant = false) {
   const blocks = typeof content === "string" ? [{ type: "text", text: content }] : content
   if (!Array.isArray(blocks)) return blocks
@@ -396,10 +406,21 @@ function stableJson(value) {
 export function historyExtends(history, previous) {
   if (!Array.isArray(previous)) return true
   if (!Array.isArray(history) || history.length < previous.length) return false
-  const comparable = (message) => stableJson({ role: message?.role,
-    content: comparableContent(message?.content, message?.role === "assistant") })
+  const comparable = (message) => ({ role: message?.role,
+    content: comparableContent(hasThinkingLead(message) ? message.content.slice(1) : message?.content,
+      message?.role === "assistant") })
   for (let index = 0; index < previous.length; index++) {
-    if (comparable(history[index]) !== comparable(previous[index])) return false
+    const actual = comparable(history[index])
+    const expected = comparable(previous[index])
+    if (stableJson(actual) === stableJson(expected)) continue
+    // Some clients merge the hidden lead with the answer after omitting thought
+    // blocks. Accept exactly that one extra character, only for a known lead.
+    const first = actual.content?.[0]
+    if (!hasThinkingLead(previous[index]) || first?.type !== "text" || typeof first.text !== "string" ||
+        !first.text.startsWith(STREAM_THINKING_LEAD)) return false
+    first.text = first.text.slice(STREAM_THINKING_LEAD.length)
+    if (!first.text) actual.content.shift()
+    if (stableJson(actual) !== stableJson(expected)) return false
   }
   return true
 }

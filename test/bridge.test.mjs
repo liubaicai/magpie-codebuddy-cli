@@ -171,30 +171,72 @@ test("a text turn streams through the plugin as Anthropic SSE", async (t) => {
   assert.equal(messageDelta.usage.output_tokens, 5)
 })
 
-test("thinking arrives as a thinking block when the client asks for it", async (t) => {
-  const { dir, launcher } = fakeLaunch({ prompts: [{ thinking: ["pondering"], text: ["answer"] }] })
-  cleanups.push(() => rmSync(dir, { recursive: true, force: true }))
+test("one whitespace lead precedes thinking and survives omitted or merged history", async (t) => {
+  const { dir, launcher, record } = fakeLaunch({ prompts: [1, 2, 3].map((n) => ({
+    thinking: ["pon", "dering"], text: [`answer${n}`],
+  })) })
   process.env.CODEBUDDY_PATH = launcher
-  t.after(() => {
-    delete process.env.CODEBUDDY_PATH
-    cleanupAll()
-  })
-
   const { CodeBuddyCliPlugin } = await import("../index.mjs")
   const hooks = await CodeBuddyCliPlugin()
-  t.after(() => hooks.dispose?.())
-
-  const { events } = await ask(hooks, {
-    model: "codebuddy-cli/hy3",
-    max_tokens: 100,
-    stream: true,
-    // A client that asks for thinking gets thinking blocks.
-    thinking: { type: "enabled", budget_tokens: 1024 },
-    messages: [{ role: "user", content: "hi" }],
+  t.after(async () => {
+    await hooks.dispose?.()
+    delete process.env.CODEBUDDY_PATH
+    rmSync(dir, { recursive: true, force: true })
   })
-  const blocks = blocksOf(events)
-  assert.ok(blocks.some((block) => block.type === "thinking" && block.thinking === "pondering"))
-  assert.ok(blocks.some((block) => block.type === "text" && block.text === "answer"))
+
+  const messages = [{ role: "user", content: "hi" }]
+  for (let n = 1; n <= 3; n++) {
+    const { status, events } = await ask(hooks, {
+      model: "codebuddy-cli/hy3", max_tokens: 100, stream: true,
+      thinking: { type: "enabled", budget_tokens: 1024 }, messages,
+    })
+    assert.equal(status, 200)
+    const blocks = blocksOf(events)
+    assert.deepEqual(blocks.map((block) => block.type), ["text", "thinking", "text"])
+    assert.equal(blocks[0].text, " ")
+    assert.equal(blocks[1].thinking, "pondering")
+    assert.equal(blocks[2].text, `answer${n}`)
+    assert.deepEqual(events.filter((event) => event.type === "content_block_delta").map((event) => event.delta.type),
+      ["text_delta", "thinking_delta", "thinking_delta", "signature_delta", "text_delta"])
+    assert.equal(stopOf(events), "end_turn")
+    // Both dropping the hidden block and merging it with the answer must reuse
+    // the real CLI session rather than silently replaying the whole history.
+    const content = n === 1 ? [{ type: "text", text: `answer${n}` }] : ` answer${n}`
+    messages.push({ role: "assistant", content }, { role: "user", content: `next${n}` })
+  }
+  const prompts = readRecord(record).filter((row) => row.method === "session/prompt")
+  assert.equal(prompts.length, 3)
+  assert.equal(new Set(prompts.map((row) => row.params.sessionId)).size, 1)
+})
+
+test("whitespace lead is optional and never added to a nonstream reply", async (t) => {
+  const { dir, launcher } = fakeLaunch({ prompts: [{ thinking: ["pondering"], text: ["answer"] }] })
+  process.env.CODEBUDDY_PATH = launcher
+  const oldLead = process.env.CODEBUDDY_BRIDGE_THINKING_LEAD
+  const { CodeBuddyCliPlugin } = await import("../index.mjs")
+  const hooks = await CodeBuddyCliPlugin()
+  t.after(async () => {
+    await hooks.dispose?.()
+    delete process.env.CODEBUDDY_PATH
+    if (oldLead === undefined) delete process.env.CODEBUDDY_BRIDGE_THINKING_LEAD
+    else process.env.CODEBUDDY_BRIDGE_THINKING_LEAD = oldLead
+    rmSync(dir, { recursive: true, force: true })
+  })
+  const body = { model: "codebuddy-cli/hy3", max_tokens: 100,
+    thinking: { type: "enabled", budget_tokens: 1024 }, messages: [{ role: "user", content: "hi" }] }
+  process.env.CODEBUDDY_BRIDGE_THINKING_LEAD = "0"
+  const first = await ask(hooks, { ...body, stream: true })
+  assert.equal(first.status, 200)
+  assert.deepEqual(blocksOf(first.events).map((block) => block.type), ["thinking", "text"])
+  delete process.env.CODEBUDDY_BRIDGE_THINKING_LEAD
+  const loader = await hooks.auth.loader()
+  const response = await loader.fetch("codebuddy-cli://local/v1/messages", {
+    method: "POST", body: JSON.stringify({ ...body, stream: false }),
+  })
+  assert.equal(response.status, 200)
+  const json = await response.json()
+  assert.deepEqual(json.content.map((block) => block.type), ["thinking", "text"])
+  assert.equal(json.content[1].text, "answer")
 })
 
 test("without a thinking request the thought text is sent as the answer", async (t) => {
@@ -257,7 +299,7 @@ test("a client tool becomes tool_use, and its result is delivered to the model",
   // MCP boundary: the tool_use the client receives, and the answer the fake
   // records for that call.
   const { dir, launcher } = fakeLaunch({
-    prompts: [{ text: ["let me check"], mcpCalls: [{ name: "get_weather", arguments: { city: "Paris" }, fold: false }] }],
+    prompts: [{ thinking: ["checking"], text: ["let me check"], mcpCalls: [{ name: "get_weather", arguments: { city: "Paris" }, fold: false }] }],
   })
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }))
   process.env.CODEBUDDY_PATH = launcher
@@ -277,8 +319,10 @@ test("a client tool becomes tool_use, and its result is delivered to the model",
   }
   const messages = [{ role: "user", content: "weather in Paris?" }]
 
-  const first = await ask(hooks, { model: "codebuddy-cli/hy3", max_tokens: 200, stream: true, tools: [tool], messages })
+  const thinking = { type: "enabled", budget_tokens: 1024 }
+  const first = await ask(hooks, { model: "codebuddy-cli/hy3", max_tokens: 200, stream: true, thinking, tools: [tool], messages })
   assert.equal(first.status, 200)
+  assert.equal(blocksOf(first.events)[0].text, " ")
   assert.equal(stopOf(first.events), "tool_use", "a tool call must end the response")
 
   const toolUse = blocksOf(first.events).find((block) => block.type === "tool_use")
@@ -292,6 +336,7 @@ test("a client tool becomes tool_use, and its result is delivered to the model",
     model: "codebuddy-cli/hy3",
     max_tokens: 200,
     stream: true,
+    thinking,
     tools: [tool],
     messages: [
       ...messages,

@@ -32,6 +32,7 @@ import { SessionPool } from "./session-pool.mjs"
 import { creditUsage } from "./credits.mjs"
 import {
   UnsupportedContent,
+  STREAM_THINKING_LEAD,
   canonicalBody,
   conversationKey,
   estimateInputTokens,
@@ -723,8 +724,18 @@ function anthropicStream(session, turn, body, msgId, signal) {
             const thinkingType = body.thinking?.type
             if (thinkingType === "disabled") continue
             const askedForThinking = thinkingType === "enabled" || thinkingType === "adaptive"
-            if (askedForThinking) emitDelta("thinking", event.text)
-            else emitDelta("text", event.text)
+            if (askedForThinking) {
+              // Magpie holds untrusted reasoning until ordinary content begins.
+              // Only after a real thought arrives, emit one whitespace text block
+              // to release that hold. Empty text/pings do not release it. Keep
+              // nonstream responses and already-started answers unchanged.
+              if (event.text && !open && content.length === 0 && body.stream !== false &&
+                  process.env.CODEBUDDY_BRIDGE_THINKING_LEAD !== "0") {
+                emitDelta("text", STREAM_THINKING_LEAD)
+                emittedOutput -= STREAM_THINKING_LEAD.length // not model output
+              }
+              emitDelta("thinking", event.text)
+            } else emitDelta("text", event.text)
             continue
           }
           if (event.type === "usage") continue

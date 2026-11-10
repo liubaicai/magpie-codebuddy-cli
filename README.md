@@ -177,11 +177,17 @@ CodeBuddy 的思考内容怎么发出去，取决于客户端有没有要：
 - **请求里带 `thinking: { "type": "enabled" }`**：以 `thinking` 块发送，客户端显示为思考过程。
 - **没带**：思考内容并入正文发送。
 
-第二条是为了解决一个实际问题：Magpie 网关只在客户端自己要了 thinking 时才转发 `thinking`
-块，否则直接丢掉。客户端没要的时候如果仍按 thinking 块发，用户在模型思考的那十几秒里
-什么都看不到——实测首个内容要等 16 秒。并进正文后同样一次请求 2.5 秒就开始出内容。
-
+未请求思考时，将 thought 内容作为正文发送，避免客户端过滤未请求的思考后看不到模型进展。
 `thinking: { "type": "disabled" }` 关掉思考内容，只有最终回答。
+
+流式请求首次收到真实思考、且此前尚未输出正文时，默认先发送一个只含 **单个 ASCII 空格** 的
+`text` 块，再逐片发送原始思考。Magpie 0.1.3492 将非空文本认作正文已开始，因此不会继续扣住
+后面的思考；空字符串和 ping 不能触发放行。每个响应最多发送一次，非流式回复不添加，空格不计入
+模型输出用量。历史匹配兼容客户端保留、删掉或与答案合并这个空白块。
+
+这是绕过网关思考缓冲的兼容措施，可用 `CODEBUDDY_BRIDGE_THINKING_LEAD=0` 关闭。账号选择策略
+不变，但在首个思考已交付之后，Magpie 不能再把这次输出完整藏起来后无痕重试；后续错误按已开始
+的流处理，可能使用网关支持的流内切换。首个思考之前的鉴权错误处理不变。
 
 ### 推理强度
 
@@ -214,6 +220,7 @@ DSH 的对应兼容选项是 `compat.forceAdaptiveThinking: true`；Magpie 管�
 | `CODEBUDDY_BRIDGE_IDLE_MS` | 600000 | 进程空闲多久后回收 |
 | `CODEBUDDY_BRIDGE_QUEUE_MS` | 300000 | 同一对话等待前一请求完成的最长时间，超时返回 503 |
 | `CODEBUDDY_BRIDGE_FIRST_EVENT_MS` | 2500 | 流开始前等待首个事件，以便将立即失败转成 HTTP 错误；不是整轮超时 |
+| `CODEBUDDY_BRIDGE_THINKING_LEAD` | 开启 | 首个真实思考前发送一个空格正文块，绕过 Magpie 思考缓冲；设为 `0` 关闭 |
 | `CODEBUDDY_BRIDGE_START_TIMEOUT_MS` | 90000 | 进程启动与 ACP 握手的超时 |
 | `CODEBUDDY_BRIDGE_TURN_IDLE_MS` | 600000 | 一轮里多久没有任何输出就判定卡住 |
 | `CODEBUDDY_BRIDGE_TOOL_DEADLINE_MS` | 150000 | 工具跑这么久还没结束时，先回 "still running" |
