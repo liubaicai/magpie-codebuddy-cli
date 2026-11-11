@@ -47,6 +47,7 @@ import {
 } from "./translate.mjs"
 
 const PROVIDER_ID = "codebuddy-cli"
+const { magpie: BRAND } = JSON.parse(fs.readFileSync(new URL("./package.json", import.meta.url), "utf8"))
 const NPM_ANTHROPIC = "@ai-sdk/anthropic"
 
 // The base URL the plugin pretends to serve. No request ever leaves the machine
@@ -1305,8 +1306,14 @@ export const CodeBuddyCliPlugin = async () => {
   }
 
   return {
+    config: async (config) => {
+      config.provider ??= {}
+      config.provider[PROVIDER_ID] ??= {}
+      Object.assign(config.provider[PROVIDER_ID], { name: BRAND.name, npm: NPM_ANTHROPIC, api: VIRTUAL_BASE })
+    },
     auth: {
       provider: PROVIDER_ID,
+      icon: BRAND.icon,
       // Several accounts, one per CodeBuddy sign-in: Magpie keeps each under its
       // own key and routes across them (smart, order, rotate, …). Not `single`.
       methods: [
