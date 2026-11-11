@@ -1,66 +1,50 @@
-# NOTICE：来源与合规说明
+# 来源与第三方说明
 
-本包（`@magpie-community/opencode-codebuddy-cli-auth`，版本 0.1.3）是一个独立的 Magpie /
-OpenCode provider 插件，把本机的腾讯 CodeBuddy CLI 接入 Magpie。**与腾讯、CodeBuddy、
-WorkBuddy 官方均无隶属关系，也未获其认可。**
+本项目由 [liubaicai/magpie-codebuddy-cli](https://github.com/liubaicai/magpie-codebuddy-cli) 维护，是独立的 Magpie / OpenCode Provider 插件，与腾讯、CodeBuddy、WorkBuddy 官方均无隶属关系，也未获其认可。
 
-## 1. 包与标识
+## 项目标识与安装
 
 | 项目 | 取值 |
 |---|---|
-| npm 包名 | `@magpie-community/opencode-codebuddy-cli-auth` |
-| 版本 | `0.1.3` |
-| 仓库 | `https://github.com/magpie-community/plugins`（`packages/codebuddy-cli`） |
-| Magpie provider ID | `codebuddy-cli` |
-| 安装 | `magpie plugin add @magpie-community/opencode-codebuddy-cli-auth` |
+| 展示名 | Codebuddy CLI |
+| 包内兼容标识 | `@magpie-community/opencode-codebuddy-cli-auth` |
+| Magpie Provider ID | `codebuddy-cli` |
+| 源码与发布 | https://github.com/liubaicai/magpie-codebuddy-cli |
+| GitHub 安装源 | `github:liubaicai/magpie-codebuddy-cli` |
+| 版本 | 以 `package.json` 和对应 GitHub Release 标签为准 |
 
-## 2. 来源基线
+保留包内标识不表示已在该 npm 命名空间发布，也不表示本项目属于 magpie-community 组织。固定版本安装方法见 [README.md](README.md)。
 
-本包按 [magpie-community/plugins](https://github.com/magpie-community/plugins) 的包结构
-编写，参考了同仓 `packages/agy-cli`（另一条「把本机 CLI 经 ACP 接成 provider」的路线）的
-插件形态、`auth` / `provider` 钩子的组织方式，以及 `scripts/opencode2.mjs` 适配器。
+## 代码来源与授权
 
-**代码为独立实现。** 本包不包含 `agy-cli` 的源码，也不复制其实现：
+本项目参考 [magpie-community/plugins](https://github.com/magpie-community/plugins) 的插件包结构、Provider 钩子及 `packages/agy-cli` 的本地 CLI 接入形态。CodeBuddy 的工具桥接使用 ACP 会话提供的 HTTP MCP 服务，不需要替换 `nc` 或其他外部命令。
 
-- `agy-cli` 通过一个私有 `nc` 拦截 agy 的 IDE 拨号来实现工具桥接；本包使用 CodeBuddy ACP
-  原生支持的 HTTP MCP 服务（`session/new` 的 `mcpServers`），不需要替换任何外部命令。
-- `agy-cli` 的会话续接使用 `session/resume` 与状态文件；本包用进程池内的活会话复用，配合
-  历史哈希判断是否可以接上。
-- 模型目录、usage、错误映射、思考签名、历史渲染、权限策略均为针对 CodeBuddy ACP 的独立
-  实现。
+`opencode2.mjs` 来自上游 [scripts/opencode2.mjs](https://github.com/magpie-community/plugins/blob/main/scripts/opencode2.mjs)，以 MIT License 提供。上游在其单仓库中维护共享副本；本独立仓库保留该适配器快照，没有携带上游的共享副本检查脚本。原版权声明：
 
-`opencode2.mjs` 是仓库范围内逐字节共享的适配器（`scripts/opencode2.mjs` 为唯一编辑副本，
-`scripts/check.mjs` 校验各包副本一致），因此本包携带的是同一份字节，不是 `agy-cli` 的代码。
+```text
+Copyright (c) 2026 magpie-community contributors
+```
 
-上游 `agy-cli` 的版权声明见其 `packages/agy-cli/LICENSE`。本包新增部分以 MIT 协议发布，
-版权归 magpie-community/plugins 贡献者。
+该声明与 MIT 授权正文保留在本项目 [LICENSE](LICENSE) 中。本项目新增代码同样以 MIT License 发布。
 
-## 3. 与 CodeBuddy 的关系
+## 产品名称与 Logo
 
-- 插件**运行你自己安装、自己登录的 `codebuddy` CLI**，使用它公开的
-  `--acp --acp-transport stdio` 通道。不下载任何腾讯服务端，不逆向、不直连 CodeBuddy 的
-  内部模型接口。
-- 插件接收用户显式授权的账号 token：包括登录流程交给 Magpie 的凭据、Magpie 按账号提供的
-  凭据，以及 `CODEBUDDY_AUTH_TOKEN` / `CODEBUDDY_AUTH_TOKEN_FILE`。添加到 Magpie 的账号由
-  Magpie 按账号保存；插件不另外把 token 写入磁盘，不刷新 token，推理时随请求注入 CLI。
-- 登录授权和积分查询会调用 CodeBuddy 的账号、计费 HTTP 接口；模型生成仍通过 CLI 的 ACP
-  通道完成。积分查询使用对应账号的授权，不消耗模型额度。
-- 插件不提取桌面凭据、不解密系统凭据库、不改动官方客户端文件。
-- 订阅额度由 CodeBuddy 计费，插件不代为估算或规避。
+CodeBuddy、WorkBuddy、腾讯及相关产品名称、商标与图像权利归各自权利人。
 
-## 4. 使用须知
+`assets/workbuddy.webp` 是使用者提供的 WorkBuddy 图像，用作本插件的识别图标。它不是本项目原创商标，不因软件采用 MIT License 而主张相关商标或图像权利，也不表示官方合作或认可。
 
-- CodeBuddy 的服务条款与账号政策由腾讯制定并可能变化。通过本插件使用 CLI 的后果由使用者
-  自行承担，插件无法保证账号不受限制。
-- 插件的工具桥接依赖 CodeBuddy ACP 的以下行为：`session/new` 接受 HTTP `mcpServers`、
-  模型经 `DeferExecuteTool` 调用 MCP 工具、`session/request_permission` 询问授权。这些是
-  实测于 **2.181.0** 的行为，不是 CodeBuddy 公开承诺的稳定接口，升级后可能变化。
-- CodeBuddy 自己的内置工具（Bash、Edit、Write 等）默认允许，在插件宿主的工作目录运行，
-  该目录不保证是远端客户端的项目目录。`CODEBUDDY_BRIDGE_NATIVE_TOOLS=0` 可禁止内置工具，
-  仅通过客户端 MCP 工具执行操作。
+## 账号、推理与工具边界
 
-## 5. 未包含的内容
+- 模型推理通过用户自行安装的 `codebuddy --acp --acp-transport stdio` 完成；插件不绕过 CLI 直接调用内部模型接口。
+- 浏览器授权和积分查询会调用 CodeBuddy 的账号、计费 HTTP 接口。积分查询使用对应账号的授权，不发起模型推理。
+- Magpie 保存各账号凭据，插件按请求所选账号注入 CLI，不另外把 token 写入磁盘，也不实现 token 刷新。
+- 未提供账号回调的调用方可显式配置默认 token、token 文件，或使用 CLI 自身登录。已提供账号回调时，授权读取失败不会回退到机器身份。
+- 插件不提取桌面凭据、不解密系统凭据库、不修改官方客户端文件。仓库和发布包不包含真实账户凭据、CodeBuddy 本体或其 SDK。
+- CodeBuddy 原生工具默认允许，在 Magpie 宿主工作目录运行；该目录不保证是客户端项目目录。客户端工具则经本插件的 MCP 服务转交客户端执行。
+- CLI 如何加载自身配置和其他 MCP 服务由 CLI 决定。本插件未强制严格 MCP 配置隔离。
 
-本仓库不包含 CodeBuddy 本体、其 SDK、任何腾讯商标素材，也不包含真实的账户凭据。测试使用
-`test/fake-acp.mjs` 模拟的 ACP 服务覆盖推理与工具链路，不消耗模型额度。平台测试在 CLI 已
-安装时还会执行一次 `--version`，不发起模型推理。
+## 兼容性
+
+协议核验基线为 CodeBuddy CLI 2.181.0，包括 ACP 会话元数据、HTTP MCP、工具授权和思考分片行为。CLI、账号服务、订阅权限和服务条款可能更新，插件不保证未来版本的行为与该基线完全相同。
+
+默认协议回归使用假的 ACP/MCP 进程，不消耗模型额度。可选 CLI 版本检查只执行 `--version`；显式的真实模型诊断会消耗账号额度，详见 README。

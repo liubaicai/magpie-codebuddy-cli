@@ -1,271 +1,368 @@
-# codebuddy-cli
+<img src="assets/workbuddy.webp" alt="Codebuddy CLI" width="72" height="72">
 
-把本机的腾讯 CodeBuddy CLI（`codebuddy`）接成 Magpie 里的一个模型 provider。装好以后，
-OpenCode、Claude Code 等客户端经由 Magpie 调用 CodeBuddy 向本插件开放的模型，请求实际由
-`codebuddy` 进程完成。
+# Codebuddy CLI
 
-## 这是什么
+把本机的 **腾讯 CodeBuddy CLI** 接入 [Magpie](https://github.com/yetone/magpie)，在同一个网关中使用 CodeBuddy 账号的模型、思考过程和工具调用。
 
-插件以 Magpie provider 的形式运行。客户端发来 Anthropic Messages 格式的请求，插件把它
-翻译成 ACP（Agent Client Protocol）消息，交给本机的 `codebuddy --acp` 进程处理，再把输出
-翻译回流式响应。
+模型推理由真正的 `codebuddy --acp` 进程完成。插件负责账号注入、协议转换和会话管理；登录与积分查询使用 CodeBuddy 账号接口。无需另行配置模型服务商的 API key。
 
-- 底层是真正的 CodeBuddy CLI，走它自带的 ACP 通道。ACP 握手里的 `clientInfo` 是本插件
-  自己的包名，不冒充其它编辑器；模型推理只经 CLI，登录与余额查询使用账号接口。
-- 客户端自己的工具（读写文件、执行命令等）通过 MCP 暴露给模型。工具由客户端执行，结果
-  回传到同一轮 CodeBuddy 对话里，模型看到的是原生工具调用。
-- Magpie 保存各账号凭据，插件按所选账号注入 CLI。账号授权不可读时返回 401，不回退到机器身份。
-  客户端没有提供账号回调时，才可使用 CLI 自身登录或配置的默认 token。
+- 展示名：**Codebuddy CLI**
+- Provider ID：`codebuddy-cli`
+- 当前发布：**v0.1.7**
+- 安装源：本 GitHub 仓库，**不是 npm 安装地址**
 
-## 与 WorkBuddy 插件的区别
+这是独立社区项目，与腾讯、CodeBuddy、WorkBuddy 官方无隶属关系。来源、授权和 logo 说明见 [NOTICE.md](NOTICE.md)。
 
-社区里的 WorkBuddy 插件（`opencode-workbuddy-auth`）走的是 CodeBuddy 的后端 API：插件自己
-拼请求、自己带 token。本插件走的是另一条路：
+## 目录
 
-- **运行的程序**：本插件运行你装好的 `codebuddy` CLI，用 ACP 通道推理。账号可在 Magpie
-  中授权，无需先在终端登录。
-- **会话**：插件维护一个 ACP 进程池，同一段对话复用同一个 CodeBuddy 会话；会话数超出上限
-  时只回收空闲会话，回来的对话用历史重新开头。
-- **工具调用**：客户端的工具以 MCP 服务的形式交给 CodeBuddy。模型调用时，插件把这次调用
-  作为 `tool_use` 结束当前响应，客户端执行后回传结果，CodeBuddy 在同一轮里继续（见下文
-  「工具桥接」）。
-- **模型列表**：以 CodeBuddy 在 ACP 会话里给出的为准，包括账户自己的上下文窗口、是否支持
-  图片与思考等级。插件不内置模型清单。
+- [快速开始](#快速开始)
+- [安装、升级与卸载](#安装升级与卸载)
+- [账号与余额](#账号与余额)
+- [模型、思考与推理强度](#模型思考与推理强度)
+- [工具调用与工作目录](#工具调用与工作目录)
+- [会话、并发与超时](#会话并发与超时)
+- [支持范围与限制](#支持范围与限制)
+- [环境变量](#环境变量)
+- [常见问题](#常见问题)
+- [开发与验证](#开发与验证)
 
-## 功能
+## 快速开始
 
-- **CodeBuddy 开放的模型**：模型列表来自 ACP `session/new`，带每个模型的上下文窗口、
-  图片支持与思考等级。列模型时插件开一个会话问一次（不发 prompt），问到之前先列出三个常见
-  模型占位。
-- **流式输出与思考**：CodeBuddy 的 thought chunk 以 `thinking` 块返回。请求里带
-  `thinking: { "type": "disabled" }` 可关闭。
-- **图片输入**：支持内联 base64 的 PNG、JPEG、GIF、WebP，需要 CodeBuddy 声明图片能力。
-- **工具调用**：客户端声明的工具经 MCP 交给模型，支持并行与连续调用，每个调用只在客户端
-  执行一次。
-- **会话续接**：同一对话的多轮复用同一个 CodeBuddy 进程，CLI 自己保留上下文；客户端改写
-  了历史时自动开新会话，不猜。
-- **工具**：客户端的工具经 MCP 交给模型；CodeBuddy 自己的内置工具也允许，在插件宿主的工作
-  目录运行，见「工具桥接」。`CODEBUDDY_BRIDGE_NATIVE_TOOLS=0` 可关掉内置工具。
-- **不读全局 MCP 配置**：每次会话只带插件自己的 MCP 服务，`--strict-mcp-config` 未强制，
-  但会话里不传其它 server。
+### 1. 准备环境
 
-## 环境要求
+需要：
 
-- CodeBuddy CLI（`codebuddy`），支持 `--acp --acp-transport stdio`。本项目在 **2.181.0** 上
-  核验协议行为。
-- Node.js 22 或更新。
-- 支持 OpenCode 风格 provider 插件的 Magpie。
+- 支持 OpenCode 风格 Provider 插件和 GitHub 插件安装的 Magpie。
+- Node.js **22 或更新版本**。
+- 支持 `--acp --acp-transport stdio` 的 CodeBuddy CLI。
+- 能连接 GitHub、CodeBuddy 登录和模型服务的网络环境。
 
-### 安装 CodeBuddy CLI
+安装并检查 CodeBuddy CLI：
 
 ```sh
 npm install -g @tencent-ai/codebuddy-code
+codebuddy --version
 ```
 
-运行 Magpie 的用户必须能找到 CLI。桌面应用 PATH 尚未更新时可显式设置 `CODEBUDDY_PATH`
-指向 CLI 入口。
+Magpie 管理自己的插件运行时，不需要单独安装 Bun。CLI 必须安装在 **运行 Magpie 的机器** 上；只安装在远端客户端机器上无效。
 
-账号由插件在 Magpie 里登录，不需要先在终端登录 CLI。未提供账号回调的客户端可以使用 CLI
-自身登录；已提供账号回调但凭据缺失或读取失败时，必须重新授权该账号，不使用机器默认身份。
+协议行为核验基线为 CodeBuddy CLI **2.181.0**、Magpie **0.1.3492**。代码兼容 Windows、macOS 和 Linux 的启动方式，实际平台验证范围见[开发与验证](#开发与验证)。
 
-## 安装
+### 2. 安装插件
+
+推荐安装已发布的固定版本：
 
 ```sh
-magpie plugin add @magpie-community/opencode-codebuddy-cli-auth
+magpie plugin add github:liubaicai/magpie-codebuddy-cli#v0.1.7
 ```
 
-装好后 provider id 是 `codebuddy-cli`，模型写成 `codebuddy-cli/<模型>`。默认并发 8，可在
-Magpie 的 Providers 页 Concurrency 里改。
+也可以在 Magpie 的插件添加入口中粘贴：
 
-## 使用
+```text
+github:liubaicai/magpie-codebuddy-cli#v0.1.7
+```
 
-1. 在 Magpie 的 Providers 页找到 `codebuddy-cli`，点 Sign in。插件打开 CodeBuddy 自己的登录页，
-   授权完成后这个账号就加进来了。**再点一次可以加第二个账号**，以此类推。
-2. 模型名写成 `codebuddy-cli/<模型>`，模型 ID 与 CodeBuddy 给出的一致（例如
-   `codebuddy-cli/hy3`）。
-3. 在客户端里选用这个模型即可。
+安装后显示为 **Codebuddy CLI**，带有随包内置的 logo，不需要联网下载图标。
 
-登录页也可以直接粘贴 access token，用于浏览器流程到不了的环境（企业部署、无桌面的机器）。
+### 3. 添加 CodeBuddy 账号
 
-## 多账号与路由
+1. 打开 Magpie 的 Providers 页面，找到 **Codebuddy CLI**。
+2. 选择 **Sign in with CodeBuddy**，在打开的官方页面完成授权。
+3. 等待 Magpie 显示账号和模型列表。
+4. 需要第二个账号时，再次发起登录；每次成功授权保存为独立账号。
 
-每个账号是 CodeBuddy 的一次登录。Magpie 把每个账号单独保存（`plugin-auth.json` 里的
-`codebuddy-cli#xxxx`），并负责在它们之间路由：
+不需要先在终端执行 `/login`。无法完成浏览器流程时，可以选择 **Paste an access token**，填入自己有权使用的 CodeBuddy access token。
 
-| 路由 | 行为 |
-|---|---|
-| `smart` | 按用量与余量挑 |
-| `order` | 按列表顺序用，前面的满了再往后 |
-| `rotate` | 轮流 |
-| `usage` / `pace` / `weight` | 按用量、节奏、权重 |
+### 4. 在客户端选择模型
 
-这些是 Magpie 内置的，插件不参与挑选。插件要做的是三件事：
+让客户端连接 Magpie 的网关地址和调用密钥，然后从同步的模型列表中选择：
 
-- **每个请求用被选中账号的 token。** Magpie 把请求限定到某个账号，插件从 `loader` 的
-  `getAuth()` 读该账号的凭据，作为 `CODEBUDDY_AUTH_TOKEN` 交给这个请求的 CodeBuddy 进程。
-- **不同账号不共用进程。** 一段对话在账号 A 上跑过后，路由到账号 B 的同一段对话会另开进程，
-  不会拿 A 的身份回答。账号是会话键的一部分。
-- **模型列表按账号取。** Magpie 用该账号的凭据问一次模型，所以列出来的是这个账号真能用的。
+```text
+codebuddy-cli/hy3
+codebuddy-cli/deepseek-v4.1-flash
+codebuddy-cli/glm-5.3
+```
 
-账号的身份（`sub` / 昵称 / 邮箱 / 过期时间）从 token 自己的声明里读，所以同名账号也能区分开。
-token 过期后该账号的请求会返回 401，重新登录该账号即可。
+这些是常见示例，不保证每个账号都可用。实际模型 ID、上下文窗口、图片能力和推理档位以该账号的 ACP 目录为准。目录未加载或暂时无法探测时，插件可能先显示占位模型；占位列表不代表账号已获得相应模型权限。
 
-想在几个模型之间路由时，用 Magpie 的路由组：
+## 安装、升级与卸载
+
+### 跟踪默认分支
+
+希望后续直接获取默认分支更新时，可以安装：
 
 ```sh
-magpie group add cbtest models=codebuddy-cli/hy3 routing=rotate
+magpie plugin add github:liubaicai/magpie-codebuddy-cli
 ```
 
-客户端选用 `group/cbtest` 即可。上面的 `smart`、`order`、`rotate`、`usage`、`pace`
-都已在本机两个账号上实测，各自连续 6 次请求全部成功。
+固定标签安装不会自动变成下一个标签。升级固定版本时，将安装命令中的版本替换为目标发布标签后重新添加。跟踪分支安装可使用 Magpie 插件页面的更新操作。
 
-## 账号余额
+`magpie plugin update` 会更新已安装的多个插件，不是仅更新本插件。
 
-在 Magpie 的 CodeBuddy 账号用量中刷新，可分别查看每个已授权账号的剩余积分和总额度。
-命令行也可查询：
+### 版本与下载
+
+- [所有发布版本](https://github.com/liubaicai/magpie-codebuddy-cli/releases)
+- [v0.1.7](https://github.com/liubaicai/magpie-codebuddy-cli/releases/tag/v0.1.7)
+- [更新记录](CHANGELOG.md)
+
+每个本次发布的附件包含 npm 格式 `.tgz` 安装包和 SHA-256 校验文件。直接在 Magpie 安装时使用上面的 `github:` 地址即可，无需自行解压。
+
+包内保留 `@magpie-community/opencode-codebuddy-cli-auth` 作为兼容标识，不表示该版本已发布到这个 npm 命名空间，也不表示已加入 Magpie 社区市场。
+
+### 临时停用或卸载
+
+可以在 Magpie 插件页面停用、启用或移除本插件。命令行先查看实际识别到的插件名称：
+
+```sh
+magpie plugin list
+```
+
+再使用列表中的名称执行 `magpie plugin off <name>` 或 `magpie plugin rm <name>`。要删除账号，请在 Providers 页面管理对应的授权，不要把卸载插件当作清除凭据的方式。
+
+## 账号与余额
+
+### 多账号隔离
+
+Magpie 保存各账号的凭据并决定本次请求使用哪个账号。插件在每次请求时重新读取该账号的授权：
+
+- 不同账号不共用 CodeBuddy 进程。
+- 账号凭据缺失、无效或读取失败时返回 **401**，不会悄悄改用机器默认身份。
+- 模型目录按账号缓存，同一账号的并发目录刷新会合并。
+- token 过期后，需要在 Magpie 中重新授权对应账号；插件不实现 token 刷新。
+- 多个浏览器登录流程按 OAuth state 独立管理，不会因第二次登录而取消第一次。
+
+只有调用方 **没有提供账号回调** 时，才允许使用 CLI 自身登录或 `CODEBUDDY_AUTH_TOKEN` / `CODEBUDDY_AUTH_TOKEN_FILE`。在 Magpie 中管理的账号不会因读取失败而使用这些默认身份。
+
+### 账号与模型路由
+
+`smart`、`order`、`rotate` 等账号选择策略由 Magpie 提供；插件负责按最终选中的身份执行请求。路由算法、刷新周期和可选策略以 Magpie 当前版本为准。
+
+多个模型之间的路由可以使用 Magpie 的路由组，例如：
+
+```sh
+magpie group add codebuddy-pool models=codebuddy-cli/hy3,codebuddy-cli/deepseek-v4.1-flash routing=rotate
+```
+
+客户端选择 `group/codebuddy-pool` 即可。组内应仅包含账号实际可用的模型。
+
+### 积分余额
+
+在 Magpie 的账号用量中刷新，或执行：
 
 ```sh
 magpie quota codebuddy-cli
 magpie quota codebuddy-cli --json
 ```
 
-查询使用该账号自身的授权，只读调用 CodeBuddy 中国区积分资源接口，不启动 CLI，也不消耗模型点数。
-有效套餐和赠送包按官方精确字段汇总，过期或尚未生效的资源不计入余额；界面显示两位小数，
-底层保留接口精度。查询失败、分页不完整或授权失效时显示错误，不会显示成零余额，也不会改用其他账号。
+余额查询使用该账号自己的授权，读取 CodeBuddy 中国区积分资源接口，不启动 CLI，也不发起模型推理。有效套餐与赠送资源按接口的精确字段汇总，未生效和已过期的资源不计入余额。
 
-余额以刷新时的读数为准，由 Magpie 管理刷新和展示；使用量路由可以读取对应的积分窗口。
+查询失败、分页不完整或授权失效会显示错误，不会伪装成零余额，也不会换用其他账号。当前浏览器登录和积分实现面向 CodeBuddy 中国区，不承诺 WorkBuddy AI 等其他站点的账号接口兼容。
 
-## 工具桥接
-
-客户端的工具经 MCP 交给 CodeBuddy，工具名形如 `mcp__client-tools__<工具名>`。CodeBuddy 通过
-自己的 `DeferExecuteTool` 转一次，需要一次权限授予，插件对这类调用一律允许。
-
-CodeBuddy 自己的内置工具（Bash、Read、Edit、Write 等）**默认也允许**：它们在这个插件启动
-CLI 的工作目录里运行，即插件宿主的工作目录，不保证是客户端的项目目录。CodeBuddy
-把"内置工具被拒"当成整轮取消，模型也就没法继续。要强制所有操作都走客户端工具，设
-`CODEBUDDY_BRIDGE_NATIVE_TOOLS=0`。
-
-工具调用慢于 CodeBuddy 的 MCP 超时（约 150 秒）时，插件先回一句 "still running"。客户端
-结果到达后，等待原 prompt 结束，再将真实结果送入同一会话；旧的结束事件不会截断新结果的回复。
-
-`tool_use` 响应结束后，等待客户端有效工具结果的时限由 `CODEBUDDY_BRIDGE_TOOL_TIMEOUT_MS`
-控制（默认 30 分钟）。客户端不再续接时，超时会清理工具记录、关闭 CLI 并释放进程槽位。
-有效续接会取消该计时器；它不限制后续流式任务的总时长。错误的工具 ID 返回 409，但不会延长等待
-时限。仍可在超时前补回正确结果；超时后可根据完整历史重新开始。
-
-## 并发
-
-- 每个插件实例的 CLI 进程上限由 `CODEBUDDY_BRIDGE_MAX_PROCS` 决定，默认 8 个；会话、备用进程、
-  模型目录探测，以及启动中、停止中的进程共用此上限。同一账号的目录刷新会合并。
-- Magpie 的 Providers 页有单独的 Concurrency 设置。两处数值建议保持一致。
-- 进程池满且没有空闲进程可回收时，插件返回 HTTP 503。
-
-一个 CodeBuddy 进程一次只跑一轮对话。同一段对话同时来了两个请求时，后到的请求排队，
-不会清空或打断前一请求的流。前一响应完成后重新校验历史：历史一致时复用进程；改写了用户
-或助手消息、缺少前一回复、补入尚未处理的历史时，启动新进程并重放历史。
-等待超过 `CODEBUDDY_BRIDGE_QUEUE_MS`（默认 300000 毫秒）返回 HTTP 503。
-
-账号、模型、推理档位、工具名称及 schema、原生工具权限配置均参与进程复用签名。改变这些
-配置时不复用旧进程或备用进程。备用进程和启动中的进程也计入总进程上限。
-
-## 响应速度
-
-CodeBuddy 进程启动和 ACP 握手需要时间。历史一致的后续轮复用现有进程；新对话可以接管
-复用签名匹配的备用进程，否则需要冷启动。实际首个内容的耗时还取决于模型与服务端负载。
-
-进程池有空余容量时，在后台保留至多一个备用进程。账号、模型、推理档位或工具集不同，
-备用进程会被停止后重新创建。备用进程同样受 `CODEBUDDY_BRIDGE_IDLE_MS` 管理。
-Magpie 的 Concurrency 控制请求并发，进程总数由 `CODEBUDDY_BRIDGE_MAX_PROCS` 单独控制。
+## 模型、思考与推理强度
 
 ### 思考过程
 
-CodeBuddy 的思考内容怎么发出去，取决于客户端有没有要：
+| 请求方式 | 输出行为 |
+|---|---|
+| `thinking.type = "enabled"` 或 `"adaptive"` | 以独立的 `thinking` 块流式返回 |
+| `thinking.type = "disabled"` | 不转发思考内容，只返回回答 |
+| 未指定 `thinking` | 将 CLI 提供的思考内容并入正文，避免客户端过滤后看不到进展 |
 
-- **请求里带 `thinking: { "type": "enabled" }`**：以 `thinking` 块发送，客户端显示为思考过程。
-- **没带**：思考内容并入正文发送。
+`disabled` 控制思考内容的转发，不保证关闭模型服务端的推理计算。
 
-未请求思考时，将 thought 内容作为正文发送，避免客户端过滤未请求的思考后看不到模型进展。
-`thinking: { "type": "disabled" }` 关掉思考内容，只有最终回答。
+默认启用 Magpie 思考缓冲兼容：流式响应首次收到真实思考、此前尚未输出正文时，先发送一个仅含 **一个 ASCII 空格** 的正文块，再持续发送思考。空字符串和 ping 无法触发 Magpie 0.1.3492 的放行逻辑。每个响应最多添加一次，非流式回复不添加，空格不计入模型输出用量。
 
-流式请求首次收到真实思考、且此前尚未输出正文时，默认先发送一个只含 **单个 ASCII 空格** 的
-`text` 块，再逐片发送原始思考。Magpie 0.1.3492 将非空文本认作正文已开始，因此不会继续扣住
-后面的思考；空字符串和 ping 不能触发放行。每个响应最多发送一次，非流式回复不添加，空格不计入
-模型输出用量。历史匹配兼容客户端保留、删掉或与答案合并这个空白块。
+需要关闭时设置：
 
-这是绕过网关思考缓冲的兼容措施，可用 `CODEBUDDY_BRIDGE_THINKING_LEAD=0` 关闭。账号选择策略
-不变，但在首个思考已交付之后，Magpie 不能再把这次输出完整藏起来后无痕重试；后续错误按已开始
-的流处理，可能使用网关支持的流内切换。首个思考之前的鉴权错误处理不变。
+```text
+CODEBUDDY_BRIDGE_THINKING_LEAD=0
+```
+
+思考一旦交付给客户端，网关就不能再完全隐藏这次输出后重试；后续错误按已开始的流处理。具体切换行为取决于 Magpie。
 
 ### 推理强度
 
-插件优先读取明确的档位：Anthropic 的 `output_config.effort`，以及兼容接口的
-`reasoning_effort` / `reasoning.effort`。只有没有明确档位时，才按 Magpie 相同的规则
-将 `thinking.budget_tokens` 换算为档位。最终档位通过 `--effort` 传给 CodeBuddy；
-备用进程只在账号、模型、档位、工具集及权限配置均一致时复用。
+优先读取显式档位：
 
-插件模型目录不再默认声明 8192 的推理模型输出上限，未提供上限时使用 32768 作为接口预算。
-Magpie 会将其同步给 DSH，使 high 的 16384 思考预算得以保留，不再被截成 7168 后误判为 medium。
-这不是 CodeBuddy 的生成长度保证，实际生成由 CLI 控制。
+- `output_config.effort`
+- `reasoning_effort`
+- `reasoning.effort`
 
-自定义 Anthropic 客户端也可使用 `thinking: {type: "adaptive"}` 加
-`output_config: {effort: "high"}` 直接指定档位，无需从预算反推。
-DSH 的对应兼容选项是 `compat.forceAdaptiveThinking: true`；Magpie 管理的模型配置会被自动重写，
-不应依赖直接修改生成配置。预算模式无法区分使用同一预算的 xhigh/max，直接指定档位可避免这种歧义。
+未指定显式档位时，才将 `thinking.budget_tokens` 映射为档位。最终通过 `--effort` 传给 CLI；会根据账户目录提供的档位选择最接近的受支持值。
 
-## 平台
+支持的档位来自 CLI，不是所有模型都有相同选项。账号、模型或档位变化时，不复用不匹配的进程。接口中的 `max_tokens` 与目录输出预算不构成 CLI 的严格生成长度保证。
 
-- **macOS、Linux**：支持。
-- **原生 Windows**：支持。npm 装的 `codebuddy.cmd` 不能直接 spawn，插件读这个 shim 找到
-  真正的 Node 入口，用当前 Node 进程启动它，全程不经过 `cmd.exe`。
+### Anthropic Messages 请求示例
+
+以下是 Bash 示例。网关地址和密钥以 Magpie 设置页为准，`MAGPIE_API_KEY` 是 **Magpie 调用密钥**，不是 CodeBuddy token：
+
+```bash
+export MAGPIE_API_KEY='替换为你的 Magpie 调用密钥'
+curl -N http://127.0.0.1:3425/v1/messages \
+  -H "Authorization: Bearer $MAGPIE_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -H 'anthropic-version: 2023-06-01' \
+  -d '{
+    "model": "codebuddy-cli/deepseek-v4.1-flash",
+    "stream": true,
+    "max_tokens": 32768,
+    "thinking": {"type": "enabled", "budget_tokens": 16384},
+    "output_config": {"effort": "high"},
+    "messages": [{"role": "user", "content": "解释一下 ACP 与 MCP 的分工。"}]
+  }'
+```
+
+其他协议由 Magpie 转换；插件接收的是 Anthropic Messages 格式，不是通用 HTTP 代理。
+
+## 工具调用与工作目录
+
+客户端声明的工具由插件转换为一个监听本机回环地址的 HTTP MCP 服务，CLI 通过它调用客户端工具：
+
+```text
+客户端请求 → Magpie → 插件 → CodeBuddy CLI（ACP）
+                            ↕ HTTP MCP
+客户端执行工具 ← tool_use / tool_result
+```
+
+工具请求带有随机令牌，插件校验令牌与路径；调用记录按插件实例和会话隔离。
+
+### 两类工具
+
+| 工具 | 执行位置 | 默认行为 |
+|---|---|---|
+| 客户端声明的 MCP 工具 | 客户端 | 通过工具轮调用并回传结果 |
+| CodeBuddy 原生 Bash、Read、Edit、Write 等 | **运行 Magpie 的宿主机** | 允许，由 CLI 执行 |
+
+原生工具的工作目录是插件宿主的 `process.cwd()`，**不保证是客户端项目目录**。远端客户端尤其要区分这两个位置。
+
+希望操作只通过客户端工具时，设置 `CODEBUDDY_BRIDGE_NATIVE_TOOLS=0`，不要同时开启 `CODEBUDDY_BRIDGE_SKIP_PERMISSIONS`。CLI 可能将原生工具拒绝视为本轮取消，不能保证它一定改用客户端工具。
+
+插件只为会话显式提供自己的 MCP 服务，未强制 `--strict-mcp-config`。CLI 如何加载自身配置和其他 MCP 服务由 CLI 决定，本插件不提供完整配置隔离承诺。
+
+### 慢工具与迟到结果
+
+工具迟迟未完成时，`CODEBUDDY_BRIDGE_TOOL_DEADLINE_MS`（默认 150 秒）会先向 CLI 返回 `still running` 占位结果。客户端的真实结果到达后，等原 prompt 结束，再串行提交给同一会话；旧结束事件不会提前截断真实结果的回复。
+
+每次 `tool_use` 响应结束后，插件最多等待 `CODEBUDDY_BRIDGE_TOOL_TIMEOUT_MS`（默认 30 分钟）的有效续接。超时会清理该轮工具记录、关闭 CLI 并释放槽位；错误工具 ID 不延长时限。有效续接会取消计时器。
+
+插件不能替客户端保证任意重试、改写历史或进程重启下的工具副作用“恰好一次”。涉及写入、支付或外部提交的工具应由客户端自行处理幂等。
+
+## 会话、并发与超时
+
+- 同一账号、模型、推理档位、系统指令和工具配置下，历史一致的后续轮可以复用活会话。
+- 改写历史、变更工具 schema、切换账号或进程被回收后，会使用请求中的历史重新建立上下文。
+- 池有空余时，后台最多保留一个匹配配置的备用进程。
+- 活会话、备用进程、目录探测，以及启动中、停止中的 CLI **共用同一进程上限**，默认每插件实例 8 个。
+- 同一对话的并发请求排队等待；全池容量不足且无空闲进程可回收时返回 503。
+
+Magpie 的 Provider Concurrency 和本插件的进程上限是两处设置，可以按机器资源协调。提高请求并发不等于提高 CLI 进程上限。
+
+**模型任务没有固定总时长限制。** `CODEBUDDY_BRIDGE_TURN_IDLE_MS` 按无事件进展的时长判定卡住；持续有进展不会仅因总耗时变长而被终止。等待客户端工具结果的计时器只在没有响应流读取者的续接阶段工作，不限制续接后的活跃任务。
+
+## 支持范围与限制
+
+| 项目 | 支持情况 |
+|---|---|
+| 文字请求、流式与非流式回复 | 支持 |
+| system/developer 文字指令 | 按消息顺序合并为客户端指令；非文字指令明确报错 |
+| 图片 | 当前轮支持内联 base64 PNG、JPEG、GIF、WebP，还需模型声明图片能力 |
+| 文字文档 | 支持 text 源，以及 base64 的 `text/plain`、`text/markdown` |
+| PDF、音频、视频及远程图片 URL | 不作为这些媒体的原生输入支持；不支持的输入会报错 |
+| 模型目录与可用能力 | 来自账号的 ACP 元数据，失败时可能使用缓存或占位目录 |
+| 会话持久化 | 活进程内保留，不保证 Magpie/CLI 重启后恢复原生会话 |
+| OpenCode 兼容入口 | 包含 1.x / 2.x 适配入口；经 Magpie 使用时，客户端无需另装本插件 |
+
+新进程的历史重放是文字转录，不等同于原生完整会话恢复。转录总预算约 96 Ki 字符；工具参数、工具结果和文档片段有约 8 Ki 字符的单项裁剪。更早内容可能省略，历史图片只保留占位描述。需要再次分析图片时请重新发送图片。
+
+原生 Windows 使用 Node 入口解析 npm shim，启动 CLI 不经 `cmd.exe`。macOS/Linux 使用独立进程组；取消和回收时会处理该组。CLI 协议及账号服务行为可能随版本变化，遇到兼容问题请提交版本与脱敏错误信息。
 
 ## 环境变量
 
+环境变量必须对 **Magpie 宿主进程** 可见。终端里设置变量不会改变已经运行的桌面 Magpie；改动后需重新启动对应宿主。
+
 | 变量 | 默认值 | 作用 |
 |---|---|---|
-| `CODEBUDDY_PATH` / `CODEBUDDY_BIN` | 按 PATH 查找 | 指定 CLI 入口；给了就只用它，不可用时报错而不是换一个 |
-| `CODEBUDDY_BRIDGE_MAX_PROCS` | 8 | CodeBuddy 进程池上限 |
-| `CODEBUDDY_BRIDGE_IDLE_MS` | 600000 | 进程空闲多久后回收 |
-| `CODEBUDDY_BRIDGE_QUEUE_MS` | 300000 | 同一对话等待前一请求完成的最长时间，超时返回 503 |
-| `CODEBUDDY_BRIDGE_FIRST_EVENT_MS` | 2500 | 流开始前等待首个事件，以便将立即失败转成 HTTP 错误；不是整轮超时 |
-| `CODEBUDDY_BRIDGE_THINKING_LEAD` | 开启 | 首个真实思考前发送一个空格正文块，绕过 Magpie 思考缓冲；设为 `0` 关闭 |
-| `CODEBUDDY_BRIDGE_START_TIMEOUT_MS` | 90000 | 进程启动与 ACP 握手的超时 |
-| `CODEBUDDY_BRIDGE_TURN_IDLE_MS` | 600000 | 一轮里多久没有任何输出就判定卡住 |
-| `CODEBUDDY_BRIDGE_TOOL_DEADLINE_MS` | 150000 | 工具跑这么久还没结束时，先回 "still running" |
-| `CODEBUDDY_BRIDGE_TOOL_TIMEOUT_MS` | 1800000 | 每次工具响应结束后等待有效续接的时限，超时关闭会话并释放槽位；流式输出期间不计时 |
-| `CODEBUDDY_BRIDGE_CATALOG_TTL_MS` | 300000 | 模型列表的缓存时长 |
-| `CODEBUDDY_BRIDGE_NATIVE_TOOLS` | 开启 | 设为 `0` 禁止 CodeBuddy 自己的内置工具，只走客户端工具 |
-| `CODEBUDDY_BRIDGE_SKIP_PERMISSIONS` | 关闭 | 设为 `1` 传 `--dangerously-skip-permissions`，仅用于可信任务 |
-| `CODEBUDDY_AUTH_TOKEN` | 未设置 | 未提供账号回调时使用的默认 token；账号回调失败不回退到它 |
-| `CODEBUDDY_AUTH_TOKEN_FILE` | 未设置 | 同上，从一个文件读，每轮重新读；接受裸 token，或含 `accessToken` / `auth.accessToken` 的 JSON |
-| `CODEBUDDY_CLI_DISABLE_AUTO_UPDATE` | 插件设为 `true` | CodeBuddy 自己的变量；你设了就用你的值 |
+| `CODEBUDDY_PATH` / `CODEBUDDY_BIN` | PATH 查找 | 指定 CLI 入口。`CODEBUDDY_PATH` 优先；显式路径不可用时直接报错，不另找其他 CLI |
+| `CODEBUDDY_BRIDGE_MAX_PROCS` | `8` | 每个插件实例的 CLI 进程总上限 |
+| `CODEBUDDY_BRIDGE_IDLE_MS` | `600000` | 空闲进程回收时限，单位毫秒 |
+| `CODEBUDDY_BRIDGE_QUEUE_MS` | `300000` | 同一对话排队时限，超时返回 503 |
+| `CODEBUDDY_BRIDGE_FIRST_EVENT_MS` | `2500` | 流开始前检查早期错误的等待窗口，不是任务超时 |
+| `CODEBUDDY_BRIDGE_THINKING_LEAD` | 开启 | 首个真实思考前发送空格正文，设 `0` 关闭 |
+| `CODEBUDDY_BRIDGE_START_TIMEOUT_MS` | 正常会话 `90000`；目录探测 `45000` | 进程启动、ACP 握手的超时 |
+| `CODEBUDDY_BRIDGE_TURN_IDLE_MS` | `600000` | 活跃响应中无事件进展的最长时间 |
+| `CODEBUDDY_BRIDGE_TOOL_DEADLINE_MS` | `150000` | MCP 工具未完成时发送占位结果的等待时间 |
+| `CODEBUDDY_BRIDGE_TOOL_TIMEOUT_MS` | `1800000` | 每次工具响应后等待有效客户端续接的时限 |
+| `CODEBUDDY_BRIDGE_CATALOG_TTL_MS` | `300000` | 模型目录缓存时长 |
+| `CODEBUDDY_BRIDGE_NATIVE_TOOLS` | 开启 | 设 `0` 拒绝 CodeBuddy 原生工具 |
+| `CODEBUDDY_BRIDGE_SKIP_PERMISSIONS` | 关闭 | 设 `1` 添加 `--dangerously-skip-permissions`，仅用于明确可信的环境 |
+| `CODEBUDDY_AUTH_TOKEN` | 未设置 | 无账号回调时的默认 token |
+| `CODEBUDDY_AUTH_TOKEN_FILE` | 未设置 | 同上，读取裸 token 或含 `accessToken` / `auth.accessToken` 的 JSON |
+| `CODEBUDDY_CLI_DISABLE_AUTO_UPDATE` | 未设置时注入 `true` | 使用 CLI 自身的自动更新控制变量；显式配置优先 |
 
-请求提供了账号回调时，只使用该账号的 token，读取失败返回 401。这两个默认 token 变量只在
-没有账号回调时生效；也未配置 token 时，才使用 CLI 自身登录。
+`CODEBUDDY_PATH` 优先于 `CODEBUDDY_BIN`。示例：
 
-`CODEBUDDY_AUTH_TOKEN_FILE` 是给长期运行的 Magpie 用的：环境变量只会进入它之后启动的进程，
-桌面版已经在跑时改不了。token 文件每轮重新读，续期后不用重启。
-
-## 常见排查
-
-- **找不到 codebuddy**：设置 `CODEBUDDY_PATH` 指向 CLI 入口，或确认 `codebuddy` 在 PATH 里。
-- **HTTP 401，提示 CodeBuddy 拒绝了账户**：在终端运行 `codebuddy`，用 `/login` 重新登录，
-  再点一次 Sign in。插件不刷新 token。
-- **模型直接回答而没有调用工具**：确认客户端的工具确实随请求发了；CodeBuddy 会把它们当作
-  延迟工具，第一次调用需要一次权限授予，插件已经自动允许本插件 MCP 服务里的工具。
-- **HTTP 503**：进程池满。提高 `CODEBUDDY_BRIDGE_MAX_PROCS` 和 Providers 页的 Concurrency。
-- **HTTP 409**：客户端回传的工具结果与当前 CodeBuddy 轮次对不上（通常是对话中途改写了历史
-  或工具 ID）。插件不做猜测，请从最后一条自洽的消息重发。
-- **想关掉思考**：设置请求里的 `thinking: { "type": "disabled" }`。
-
-## 开发
-
-```sh
-node --test test/*.test.mjs
+```powershell
+$env:CODEBUDDY_PATH = 'C:\Users\your-name\AppData\Roaming\npm\codebuddy.cmd'
+$env:CODEBUDDY_BRIDGE_MAX_PROCS = '4'
+# 从这个环境启动 Magpie；已运行的实例需先退出。
 ```
 
-测试用假的 CodeBuddy 进程（`test/fake-acp.mjs`，一个 ACP stdio 服务）跑完整的 ACP 与 MCP
-链路，不消耗模型额度。平台测试在已安装 CLI 时还会执行 `--version`，不发起模型推理。
+```bash
+export CODEBUDDY_PATH='/usr/local/bin/codebuddy'
+export CODEBUDDY_BRIDGE_MAX_PROCS=4
+# 从这个环境启动 Magpie；已运行的实例需先退出。
+```
+
+默认 token 的优先级为 `CODEBUDDY_AUTH_TOKEN`、token 文件、CLI 自身登录。token 文件会在读取默认凭据时重新读取，便于外部续期；使用 Magpie 账号回调时仍以账号凭据为准。
+
+## 常见问题
+
+| 现象 | 排查方法 |
+|---|---|
+| 找不到 CLI / 启动失败 | 确认 CLI 安装在 Magpie 宿主机，检查 `codebuddy --version`，必要时设置 `CODEBUDDY_PATH`。桌面程序可能未继承终端 PATH |
+| 401 / 授权不可读 | 在 Magpie 中重新授权报错的账号。只在终端 `/login` 不会替换 Magpie 已保存的账号 token |
+| 409 / 工具结果不匹配 | 检查工具 ID、账号、模型、工具 schema 和历史。超时前可补正确结果；状态已失效时从自洽历史重新开始，不要反复发送错误结果 |
+| 503 | 区分同一对话仍在执行、排队超时和全池无空闲槽位。持续输出的任务应等待；被放弃的工具轮会按续接时限回收。资源允许时再提高并发和进程上限 |
+| 没看到思考 | 检查客户端是否请求并显示 thinking；确认未禁用空格兼容措施。CLI 首次启动和模型本身的等待仍会影响首片耗时 |
+| 工具没有执行 | 确认客户端发送了工具定义和工具结果，区分客户端工具与宿主原生工具；不能保证模型每轮都会调用工具 |
+| 图片或文档失败 | 图片需内联且模型支持；PDF、音视频不能按原生媒体转发，文字文档支持范围见上表 |
+| 余额查询报错 | 检查该账号授权与账号服务连接。不会自动改用其他账号或显示假零余额 |
+| 固定版本更新后仍是旧版 | 检查安装源是否仍固定旧标签；在插件页确认版本，按新的发布标签重新安装 |
+
+问题反馈请使用 [GitHub Issues](https://github.com/liubaicai/magpie-codebuddy-cli/issues)，提供插件、Magpie、CLI、Node 和操作系统版本，以及脱敏后的错误、复现步骤。不要提交 token、Magpie 调用密钥或完整账号凭据文件。
+
+## 开发与验证
+
+项目无运行时 npm 依赖。克隆后可直接运行测试：
+
+```sh
+git clone https://github.com/liubaicai/magpie-codebuddy-cli.git
+cd magpie-codebuddy-cli
+node --test --test-skip-pattern 'real CodeBuddy CLI' test/*.test.mjs
+```
+
+不加筛选的 `npm test` 在已安装 CLI 时会额外执行可选的 `--version` 检查，不发起模型推理。协议回归使用假的 ACP/MCP 进程，不消耗模型额度。发布前在 Windows 上核验；POSIX 专属用例在 Windows 上跳过，不能据此宣称已经做过 macOS/Linux 实机验证。
+
+```sh
+npm pack --dry-run
+npm pack
+```
+
+入口与主要文件：
+
+| 文件 | 用途 |
+|---|---|
+| `index.mjs` | Provider、账号接入、目录、Messages 流与工具轮 |
+| `acp.mjs` | ACP stdio 协议与 CLI 生命周期 |
+| `session-pool.mjs` | 统一进程容量、复用、排队、预热和回收 |
+| `translate.mjs` | 请求、历史、图片、文档、思考和用量转换 |
+| `accounts.mjs` / `credits.mjs` | 登录与按账号查询积分 |
+| `mcp-bridge.mjs` / `platform.mjs` | 本地工具桥接与跨平台启动 |
+| `opencode.mjs` / `opencode2.mjs` | 1.x 入口与上游 2.x 适配器快照 |
+| `diagnostics/` | 故障分析、流式时序与历史审查记录 |
+
+`diagnostics/stream-timing.mjs` 是显式的真实模型诊断，会读取本机 Magpie 账号并消耗模型额度；它不属于默认测试。`diagnostics/session-timing.mjs` 用于本地会话轨迹分析。历史诊断记录描述当时版本，不应当作当前性能承诺。
 
 ## License
 
-MIT。见 [LICENSE](LICENSE) 与 [NOTICE.md](NOTICE.md)。
+代码以 [MIT License](LICENSE) 发布。共享适配器来源及第三方产品标识说明见 [NOTICE.md](NOTICE.md)。

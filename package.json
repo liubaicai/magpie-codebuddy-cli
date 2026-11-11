@@ -1,6 +1,6 @@
 {
   "name": "@magpie-community/opencode-codebuddy-cli-auth",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Magpie/OpenCode model provider that connects your local CodeBuddy CLI through the Agent Client Protocol (codebuddy --acp), so CodeBuddy subscription models run through the real CLI",
   "type": "module",
   "main": "./opencode.mjs",
@@ -19,6 +19,7 @@
     "opencode.mjs",
     "opencode2.mjs",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE",
     "NOTICE.md",
     "assets/workbuddy.webp"
@@ -35,8 +36,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/magpie-community/plugins.git",
-    "directory": "packages/codebuddy-cli"
+    "url": "git+https://github.com/liubaicai/magpie-codebuddy-cli.git"
+  },
+  "homepage": "https://github.com/liubaicai/magpie-codebuddy-cli#readme",
+  "bugs": {
+    "url": "https://github.com/liubaicai/magpie-codebuddy-cli/issues"
   },
   "scripts": {
     "test": "node --test test/*.test.mjs"
