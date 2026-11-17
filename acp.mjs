@@ -7,6 +7,7 @@
 // This file only speaks the protocol; what a turn means is bridge.mjs's business.
 
 import { spawnCodebuddy } from "./platform.mjs"
+import { trackChild, untrackChild } from "./process-lifecycle.mjs"
 
 const LINE_LIMIT = 64 * 1024 * 1024
 const DEFAULT_START_TIMEOUT_MS = 60_000
@@ -492,6 +493,9 @@ export class CodeBuddySession {
       timer.unref?.()
       child.once("close", finish)
     })
+    // stop() has dealt with the process; a later host exit must not signal a pid
+    // that may have been reused in the meantime.
+    untrackChild(child)
   }
 }
 
@@ -512,6 +516,9 @@ export async function openCodeBuddySession({
   signal,
 }) {
   const child = spawnCodebuddy(launch, argv, { cwd, env })
+  // The CLI leads its own process group (see spawnCodebuddy). Tie that group to
+  // this process so a host restart cannot leave it running behind the next one.
+  trackChild(child, { group: process.platform !== "win32" })
 
   // Build the session object before the handshake so the metadata notification
   // that arrives before session/new has somewhere to go.

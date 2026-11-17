@@ -1,5 +1,9 @@
 # 更新记录
 
+## 未发布
+
+- 宿主退出或收到 SIGTERM / SIGINT / SIGHUP 时，回收本进程启动过的 `codebuddy --acp` 进程组。此前 CLI 以独立进程组启动，Magpie 重启或 supervisor 停止时没有清理钩子，遗留进程会被 init 收养并长期占用内存；新实例也无法识别它们。
+
 ## v0.1.7
 
 首次通过本仓库公开发布，支持在 Magpie 中按 GitHub 地址或固定标签安装。

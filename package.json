@@ -16,6 +16,7 @@
     "translate.mjs",
     "session-pool.mjs",
     "platform.mjs",
+    "process-lifecycle.mjs",
     "opencode.mjs",
     "opencode2.mjs",
     "README.md",
